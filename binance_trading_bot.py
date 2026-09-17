@@ -17,11 +17,11 @@ import signal
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 LOG = logging.getLogger("orca")
 
@@ -58,6 +58,12 @@ class Config:
     db_path: Path = Path(os.getenv("TRADES_DB_PATH", "data/trades.jsonl"))
 
     def validate(self) -> None:
+        if not self.symbols or any(not symbol.isalnum() for symbol in self.symbols):
+            raise ValueError("SYMBOLS must contain valid alphanumeric Binance symbols")
+        if self.initial_equity <= 0 or self.max_open_positions < 1 or self.max_trades_per_hour < 1:
+            raise ValueError("Initial equity and trade limits must be positive")
+        if self.atr_period < 2 or self.atr_stop_mult <= 0 or self.atr_take_mult <= 0:
+            raise ValueError("ATR settings must be positive")
         if self.risk_per_trade_pct <= 0 or self.risk_per_trade_pct > 2:
             raise ValueError("RISK_PER_TRADE_PCT must be > 0 and <= 2")
         if self.mode is Mode.LIVE and self.live_confirmation != "I_UNDERSTAND_RISK":
@@ -170,10 +176,24 @@ class RiskGate:
     def __init__(self, cfg: Config):
         self.cfg, self.start_equity, self.equity = cfg, cfg.initial_equity, cfg.initial_equity
         self.peak_equity, self.daily_pnl, self.trades = cfg.initial_equity, 0.0, 0
+        self.day = datetime.now(timezone.utc).date()
+        self.trade_times: list[float] = []
+
+    def _roll_day(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        if today != self.day:
+            self.day, self.daily_pnl = today, 0.0
+
+    def _trim_hour(self) -> None:
+        cutoff = time.time() - 3600
+        self.trade_times = [stamp for stamp in self.trade_times if stamp >= cutoff]
 
     def approve(self, signal: Signal, price: float, a: Optional[float], open_count: int) -> tuple[bool, float, str]:
+        self._roll_day(); self._trim_hour()
         if signal is Signal.HOLD or price <= 0 or not a or open_count >= self.cfg.max_open_positions:
             return False, 0.0, "no-trade-condition"
+        if len(self.trade_times) >= self.cfg.max_trades_per_hour:
+            return False, 0.0, "hourly-trade-limit"
         if self.daily_pnl <= -self.start_equity * self.cfg.max_daily_loss_pct / 100:
             return False, 0.0, "daily-loss-limit"
         drawdown = (self.peak_equity - self.equity) / self.peak_equity * 100 if self.peak_equity else 0
@@ -184,7 +204,9 @@ class RiskGate:
         return (qty > 0, qty, "approved" if qty > 0 else "invalid-size")
 
     def closed(self, pnl: float) -> None:
+        self._roll_day()
         self.equity += pnl; self.daily_pnl += pnl; self.peak_equity = max(self.peak_equity, self.equity); self.trades += 1
+        self.trade_times.append(time.time())
 
 
 class PaperBroker:
@@ -209,8 +231,10 @@ def load_csv(path: str) -> list[Candle]:
 
 
 def backtest(candles: list[Candle], cfg: Config) -> dict[str, float]:
-    strategy, risk, broker = RegimeStrategy(cfg), RiskGate(cfg), PaperBroker(cfg, RiskGate(cfg))
-    broker.risk = risk
+    if not candles or not cfg.symbols:
+        return {"trades": 0, "pnl": 0.0, "win_rate_pct": 0.0, "profit_factor": 0.0}
+    strategy, risk = RegimeStrategy(cfg), RiskGate(cfg)
+    broker = PaperBroker(cfg, risk)
     for i in range(len(candles)):
         window = candles[:i+1]; c = candles[i]; sig = strategy.decide(window)
         closed = broker.mark(cfg.symbols[0], c.close, sig)

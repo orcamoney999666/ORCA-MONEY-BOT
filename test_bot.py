@@ -25,4 +25,15 @@ class BotTests(unittest.TestCase):
         result = backtest(candles, Config())
         self.assertIn("pnl", result); self.assertIn("trades", result)
 
+    def test_empty_backtest_is_safe(self):
+        result = backtest([], Config())
+        self.assertEqual(result["trades"], 0)
+
+    def test_hourly_limit(self):
+        cfg = Config(max_trades_per_hour=1)
+        gate = RiskGate(cfg)
+        gate.closed(-1)
+        ok, _, reason = gate.approve(Signal.BUY, 100, 2, 0)
+        self.assertFalse(ok); self.assertEqual(reason, "hourly-trade-limit")
+
 if __name__ == "__main__": unittest.main()

@@ -23,7 +23,40 @@
 
 All mutating calls (`market_order`, `place_oco_order`, `cancel_order`, `cancel_oco_order`) stay hard-gated to `Mode.LIVE`, exactly like before — paper mode never touches the real API. Covered by mocked unit tests in `test_bot.py` (no network calls or credentials needed to run the suite).
 
-Not yet wired up: an autonomous live trading loop that calls these automatically from `RegimeStrategy`/`RiskGate` signals — that is a separate, later phase.
+## Autonomous live loop: `live` command (added this session)
+
+`python3 binance_trading_bot.py live` starts a real trading loop. It only ever starts when you
+run it yourself — nothing in this repo schedules or auto-starts it — but once started it keeps
+running and trading on its own, evaluating every symbol every `LIVE_POLL_SECONDS` (default 60),
+until you stop it with Ctrl+C or `SIGTERM`.
+
+Each cycle, per symbol:
+1. Skip if there is already an open order on that symbol (no duplicate entries).
+2. Fetch recent klines and ask `RegimeStrategy` for a signal.
+3. A `SELL` signal is skipped, not sent as a real order. **Binance spot cannot short** — a
+   `SELL` only makes sense to close a position you already hold, so this bot only ever
+   opens long via `BUY` and exits via the OCO bracket below.
+4. On an approved `BUY`, it places a real market buy, then immediately places a real OCO
+   order (`place_oco_order`) as the stop-loss + take-profit bracket, using the same ATR
+   multipliers as backtest/paper mode.
+
+`RiskGate` state (equity, daily P&L, day rollover, trade count/timestamps) is persisted to
+`RISK_STATE_PATH` (default `data/risk_state.json`) and reloaded on start, so the daily-loss,
+drawdown, and hourly-trade limits stay meaningful across separate runs instead of resetting
+every time you start the loop.
+
+**Known gap:** this cycle only limits how many *new* positions can be opened
+(`MAX_OPEN_POSITIONS`). It does not yet poll filled orders back to credit/debit
+`risk.equity` with the real realized P&L once a bracket fills — that reconciliation is a
+separate next step before relying on the daily-loss/drawdown limits for capital already at risk.
+
+```bash
+export TRADING_MODE=live
+export BINANCE_API_KEY='...'
+export BINANCE_API_SECRET='...'
+export LIVE_TRADING_CONFIRM=I_UNDERSTAND_RISK
+python3 binance_trading_bot.py live
+```
 
 ## التشغيل
 

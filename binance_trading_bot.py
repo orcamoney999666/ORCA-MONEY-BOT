@@ -56,12 +56,16 @@ class Config:
     api_secret: str = os.getenv("BINANCE_API_SECRET", "")
     live_confirmation: str = os.getenv("LIVE_TRADING_CONFIRM", "")
     db_path: Path = Path(os.getenv("TRADES_DB_PATH", "data/trades.jsonl"))
+    risk_state_path: Path = Path(os.getenv("RISK_STATE_PATH", "data/risk_state.json"))
+    live_poll_seconds: int = int(os.getenv("LIVE_POLL_SECONDS", "60"))
 
     def validate(self) -> None:
         if not self.symbols or any(not symbol.isalnum() for symbol in self.symbols):
             raise ValueError("SYMBOLS must contain valid alphanumeric Binance symbols")
         if self.initial_equity <= 0 or self.max_open_positions < 1 or self.max_trades_per_hour < 1:
             raise ValueError("Initial equity and trade limits must be positive")
+        if self.live_poll_seconds < 5:
+            raise ValueError("LIVE_POLL_SECONDS must be >= 5")
         if self.atr_period < 2 or self.atr_stop_mult <= 0 or self.atr_take_mult <= 0:
             raise ValueError("ATR settings must be positive")
         if self.risk_per_trade_pct <= 0 or self.risk_per_trade_pct > 2:
@@ -245,6 +249,22 @@ class RiskGate:
         self.equity += pnl; self.daily_pnl += pnl; self.peak_equity = max(self.peak_equity, self.equity); self.trades += 1
         self.trade_times.append(time.time())
 
+    def state_dict(self) -> dict:
+        return {"equity": self.equity, "peak_equity": self.peak_equity, "daily_pnl": self.daily_pnl,
+                "trades": self.trades, "day": self.day.isoformat(), "trade_times": self.trade_times}
+
+    def restore(self, state: dict) -> None:
+        """Reload persisted risk state so daily-loss/drawdown/hourly limits survive across
+        separate manual `live` invocations instead of silently resetting each run."""
+        self.equity = state.get("equity", self.equity)
+        self.peak_equity = state.get("peak_equity", self.peak_equity)
+        self.daily_pnl = state.get("daily_pnl", self.daily_pnl)
+        self.trades = state.get("trades", self.trades)
+        self.trade_times = state.get("trade_times", self.trade_times)
+        if "day" in state:
+            self.day = datetime.fromisoformat(state["day"]).date()
+        self._roll_day()
+
 
 class PaperBroker:
     def __init__(self, cfg: Config, risk: RiskGate): self.cfg, self.risk, self.positions, self.trades = cfg, risk, {}, []
@@ -283,10 +303,94 @@ def backtest(candles: list[Candle], cfg: Config) -> dict[str, float]:
     return {"trades": len(broker.trades), "pnl": round(sum(t.pnl for t in broker.trades), 8), "win_rate_pct": round(wins / len(broker.trades) * 100, 2) if broker.trades else 0.0, "profit_factor": round(gross_win / gross_loss, 4) if gross_loss else 0.0}
 
 
+def load_risk_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        LOG.warning("risk state at %s is unreadable; starting fresh", path)
+        return {}
+
+
+def save_risk_state(path: Path, risk: RiskGate) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(risk.state_dict()))
+
+
+def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: RegimeStrategy) -> dict:
+    """One real evaluate-and-act pass over every symbol.
+
+    Binance spot has no shorting: a SELL signal only ever closes a position you
+    already hold, so it is skipped here rather than sent as a broken sell-to-open.
+    Real P&L reconciliation (crediting risk.equity when a bracket actually fills)
+    is not implemented yet; this cycle only prevents opening more than
+    MAX_OPEN_POSITIONS at once.
+    """
+    open_symbols = {symbol: bool(client.get_open_orders(symbol)) for symbol in cfg.symbols}
+    open_count = sum(open_symbols.values())
+    results = []
+    for symbol in cfg.symbols:
+        if open_symbols[symbol]:
+            results.append({"symbol": symbol, "action": "skipped", "reason": "open-order-exists"})
+            continue
+        candles = client.klines(symbol)
+        if not candles:
+            results.append({"symbol": symbol, "action": "skipped", "reason": "no-data"})
+            continue
+        signal = strategy.decide(candles)
+        if signal is Signal.SELL:
+            results.append({"symbol": symbol, "action": "skipped", "reason": "spot-no-short"})
+            continue
+        price = candles[-1].close
+        a = atr(candles, cfg.atr_period)
+        ok, qty, reason = risk.approve(signal, price, a, open_count)
+        if not ok:
+            results.append({"symbol": symbol, "action": "no-trade", "reason": reason})
+            continue
+        order = client.market_order(symbol, "BUY", qty)
+        stop, take = price - a * cfg.atr_stop_mult, price + a * cfg.atr_take_mult
+        bracket = client.place_oco_order(symbol, "SELL", qty, take_profit_price=take, stop_price=stop, stop_limit_price=stop)
+        open_count += 1
+        LOG.info("opened %s qty=%s entry=%.8f stop=%.8f take=%.8f", symbol, qty, price, stop, take)
+        results.append({"symbol": symbol, "action": "opened", "order": order, "bracket": bracket})
+    return {"results": results}
+
+
+def run_live(cfg: Config, client: BinanceREST) -> None:
+    """Autonomous live loop: starts only when you run this command yourself, then
+    keeps evaluating and trading on its own every LIVE_POLL_SECONDS until you stop
+    it (Ctrl+C / SIGTERM)."""
+    if cfg.mode is not Mode.LIVE:
+        raise RuntimeError("live requires TRADING_MODE=live with LIVE_TRADING_CONFIRM set")
+    risk, strategy = RiskGate(cfg), RegimeStrategy(cfg)
+    risk.restore(load_risk_state(cfg.risk_state_path))
+    stop_requested = {"flag": False}
+
+    def _handle_stop(signum, _frame):
+        LOG.info("stop signal %s received; exiting after the current cycle", signum)
+        stop_requested["flag"] = True
+
+    signal.signal(signal.SIGINT, _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
+    LOG.info("live loop started for %s, polling every %ss — started by explicit command, not scheduled", cfg.symbols, cfg.live_poll_seconds)
+    while not stop_requested["flag"]:
+        try:
+            run_live_cycle(cfg, client, risk, strategy)
+        except Exception:
+            LOG.exception("live cycle failed; will retry next poll")
+        save_risk_state(cfg.risk_state_path, risk)
+        for _ in range(cfg.live_poll_seconds):
+            if stop_requested["flag"]:
+                break
+            time.sleep(1)
+    LOG.info("live loop stopped cleanly")
+
+
 def main() -> int:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["backtest", "fetch", "config-check"])
+    parser.add_argument("command", choices=["backtest", "fetch", "config-check", "live"])
     parser.add_argument("--csv", help="CSV columns: timestamp,open,high,low,close,volume")
     args = parser.parse_args(); cfg = Config(); cfg.validate()
     if args.command == "config-check": print(json.dumps({"mode": cfg.mode.value, "symbols": cfg.symbols, "live_enabled": cfg.mode is Mode.LIVE}, indent=2)); return 0
@@ -295,6 +399,8 @@ def main() -> int:
         print(json.dumps(backtest(load_csv(args.csv), cfg), indent=2)); return 0
     client = BinanceREST(cfg)
     if not cfg.symbols: raise SystemExit("SYMBOLS is empty")
+    if args.command == "live":
+        run_live(cfg, client); return 0
     print(json.dumps([c.__dict__ for c in client.klines(cfg.symbols[0])[-5:]], indent=2)); return 0
 
 if __name__ == "__main__": raise SystemExit(main())

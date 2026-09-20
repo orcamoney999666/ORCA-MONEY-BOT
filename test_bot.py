@@ -1,11 +1,15 @@
 import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("TRADING_MODE", "paper")
-from binance_trading_bot import BinanceREST, Candle, Config, Mode, RegimeStrategy, RiskGate, Signal, atr, backtest
+from binance_trading_bot import (
+    BinanceREST, Candle, Config, Mode, RegimeStrategy, RiskGate, Signal, atr, backtest,
+    load_risk_state, run_live, run_live_cycle, save_risk_state,
+)
 
 class BotTests(unittest.TestCase):
     def test_atr_is_positive(self):
@@ -45,8 +49,20 @@ def _mock_response(payload: bytes):
     return resp
 
 
-def _live_config() -> Config:
-    return Config(mode=Mode.LIVE, api_key="key", api_secret="secret", live_confirmation="I_UNDERSTAND_RISK")
+def _live_config(**overrides) -> Config:
+    base = dict(mode=Mode.LIVE, api_key="key", api_secret="secret", live_confirmation="I_UNDERSTAND_RISK")
+    base.update(overrides)
+    return Config(**base)
+
+
+def _trending_candles(n: int = 70, rising: bool = True) -> list[Candle]:
+    candles = []
+    price = 100.0
+    step = 0.5 if rising else -0.5
+    for i in range(n):
+        price += step
+        candles.append(Candle(i, price - 0.2, price + 1.0, price - 1.0, price))
+    return candles
 
 
 class BinanceRESTOrderTests(unittest.TestCase):
@@ -119,6 +135,101 @@ class BinanceRESTOrderTests(unittest.TestCase):
         request = mock_urlopen.call_args[0][0]
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(result["status"], "NEW")
+
+
+class RiskStatePersistenceTests(unittest.TestCase):
+    def test_state_dict_round_trips_through_restore(self):
+        gate = RiskGate(Config())
+        gate.closed(50.0)
+        restored = RiskGate(Config())
+        restored.restore(gate.state_dict())
+        self.assertEqual(restored.equity, gate.equity)
+        self.assertEqual(restored.trades, gate.trades)
+        self.assertEqual(restored.trade_times, gate.trade_times)
+
+    def test_save_and_load_round_trip_through_disk(self):
+        gate = RiskGate(Config())
+        gate.closed(-20.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "risk_state.json"
+            save_risk_state(path, gate)
+            loaded = load_risk_state(path)
+        self.assertEqual(loaded["equity"], gate.equity)
+        self.assertEqual(loaded["trades"], 1)
+
+    def test_load_missing_file_returns_empty_dict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(load_risk_state(Path(tmp) / "missing.json"), {})
+
+    def test_load_corrupt_file_returns_empty_dict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            path.write_text("not json")
+            self.assertEqual(load_risk_state(path), {})
+
+
+class LiveCycleTests(unittest.TestCase):
+    """run_live_cycle is one pass; the network is always a MagicMock(spec=BinanceREST)."""
+
+    def _client(self, candles, open_orders=None):
+        client = MagicMock(spec=BinanceREST)
+        client.get_open_orders.return_value = open_orders or []
+        client.klines.return_value = candles
+        client.market_order.return_value = {"status": "FILLED"}
+        client.place_oco_order.return_value = {"orderListId": 1}
+        return client
+
+    def test_skips_symbol_with_existing_open_order(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(), open_orders=[{"orderId": 1}])
+        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        self.assertEqual(result["results"][0]["reason"], "open-order-exists")
+        client.market_order.assert_not_called()
+        client.place_oco_order.assert_not_called()
+
+    def test_sell_signal_is_never_sent_as_open_short(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=False))
+        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        self.assertEqual(result["results"][0]["reason"], "spot-no-short")
+        client.market_order.assert_not_called()
+
+    def test_approved_buy_places_real_order_and_oco_bracket(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        self.assertEqual(result["results"][0]["action"], "opened")
+        client.market_order.assert_called_once()
+        self.assertEqual(client.market_order.call_args[0][1], "BUY")
+        client.place_oco_order.assert_called_once()
+        self.assertEqual(client.place_oco_order.call_args[0][1], "SELL")
+
+    def test_no_data_is_skipped_not_crashed(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client([])
+        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        self.assertEqual(result["results"][0]["reason"], "no-data")
+
+
+class LiveLoopTests(unittest.TestCase):
+    def test_run_live_blocked_outside_live_mode(self):
+        with self.assertRaises(RuntimeError):
+            run_live(Config(), MagicMock(spec=BinanceREST))
+
+    def test_run_live_stops_on_first_cycle_when_signalled(self):
+        """Simulates SIGINT arriving during the very first cycle: the loop must run
+        run_live_cycle exactly once, persist state, and exit without sleeping."""
+        client = MagicMock(spec=BinanceREST)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5, risk_state_path=Path(tmp) / "risk_state.json")
+            with patch("binance_trading_bot.run_live_cycle") as mock_cycle:
+                def _act_then_stop(*_args, **_kwargs):
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return {"results": []}
+                mock_cycle.side_effect = _act_then_stop
+                run_live(cfg, client)
+            mock_cycle.assert_called_once()
+            self.assertTrue((Path(tmp) / "risk_state.json").exists())
 
 
 if __name__ == "__main__": unittest.main()

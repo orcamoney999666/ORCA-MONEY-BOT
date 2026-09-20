@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -202,6 +203,71 @@ class BinanceREST:
         quote = self.get_convert_quote(from_asset, to_asset, from_amount)
         return self.accept_convert_quote(quote["quoteId"])
 
+    def place_limit_order(self, symbol: str, side: str, quantity: float, price: float, time_in_force: str = "GTC") -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_limit_order is disabled outside live mode")
+        params = {"symbol": symbol, "side": side, "type": "LIMIT", "timeInForce": time_in_force,
+                  "quantity": f"{quantity:.8f}", "price": f"{price:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def place_stop_loss_limit_order(self, symbol: str, side: str, quantity: float, stop_price: float, limit_price: float, time_in_force: str = "GTC") -> dict:
+        """Standalone stop-loss order (not paired with a take-profit like place_oco_order)."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_stop_loss_limit_order is disabled outside live mode")
+        params = {"symbol": symbol, "side": side, "type": "STOP_LOSS_LIMIT", "timeInForce": time_in_force,
+                  "quantity": f"{quantity:.8f}", "price": f"{limit_price:.8f}", "stopPrice": f"{stop_price:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def place_take_profit_limit_order(self, symbol: str, side: str, quantity: float, stop_price: float, limit_price: float, time_in_force: str = "GTC") -> dict:
+        """Standalone take-profit order (not paired with a stop-loss like place_oco_order)."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_take_profit_limit_order is disabled outside live mode")
+        params = {"symbol": symbol, "side": side, "type": "TAKE_PROFIT_LIMIT", "timeInForce": time_in_force,
+                  "quantity": f"{quantity:.8f}", "price": f"{limit_price:.8f}", "stopPrice": f"{stop_price:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def cancel_all_open_orders(self, symbol: str) -> list[dict]:
+        """Flattens every open order (including OCO legs) on one symbol in a single call."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("cancel_all_open_orders is disabled outside live mode")
+        return self._request("/api/v3/openOrders", {"symbol": symbol}, signed=True, method="DELETE")
+
+    def get_all_orders(self, symbol: str, limit: int = 500) -> list[dict]:
+        """Full order history for a symbol (not just currently-open orders)."""
+        return self._request("/api/v3/allOrders", {"symbol": symbol, "limit": limit}, signed=True)
+
+    def get_my_trades(self, symbol: str, limit: int = 500) -> list[dict]:
+        """Actual executions/fills for a symbol — what a user sees under Trade History."""
+        return self._request("/api/v3/myTrades", {"symbol": symbol, "limit": limit}, signed=True)
+
+    def get_exchange_info(self, symbol: str | None = None) -> dict:
+        """Public endpoint: trading rules and filters. No signing needed, same as klines()."""
+        return self._request("/api/v3/exchangeInfo", {"symbol": symbol} if symbol else {})
+
+    def get_symbol_filters(self, symbol: str) -> dict:
+        """step_size/tick_size/min_qty/min_notional for one symbol, so a computed order
+        quantity or price can be rounded to what Binance will actually accept instead of
+        being rejected. Verified field names against Binance's exchangeInfo docs."""
+        info = self.get_exchange_info(symbol)
+        filters = {f["filterType"]: f for f in info["symbols"][0]["filters"]}
+        lot = filters.get("LOT_SIZE", {})
+        price_filter = filters.get("PRICE_FILTER", {})
+        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+        return {
+            "step_size": float(lot["stepSize"]) if lot.get("stepSize") else None,
+            "min_qty": float(lot["minQty"]) if lot.get("minQty") else None,
+            "tick_size": float(price_filter["tickSize"]) if price_filter.get("tickSize") else None,
+            "min_notional": float(notional["minNotional"]) if notional.get("minNotional") else None,
+        }
+
+
+def round_to_step(value: float, step: Optional[float]) -> float:
+    """Round down to the nearest multiple of step (e.g. LOT_SIZE stepSize / PRICE_FILTER
+    tickSize) so real orders aren't rejected for violating exchange precision rules."""
+    if not step:
+        return value
+    return round(math.floor(round(value / step, 8)) * step, 8)
+
 
 def sma(values: list[float], period: int) -> Optional[float]:
     return sum(values[-period:]) / period if len(values) >= period else None
@@ -374,8 +440,17 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
         if not ok:
             results.append({"symbol": symbol, "action": "no-trade", "reason": reason})
             continue
+        filters = client.get_symbol_filters(symbol)
+        qty = round_to_step(qty, filters["step_size"])
+        if filters["min_qty"] and qty < filters["min_qty"]:
+            results.append({"symbol": symbol, "action": "no-trade", "reason": "below-min-qty"})
+            continue
+        if filters["min_notional"] and qty * price < filters["min_notional"]:
+            results.append({"symbol": symbol, "action": "no-trade", "reason": "below-min-notional"})
+            continue
         order = client.market_order(symbol, "BUY", qty)
-        stop, take = price - a * cfg.atr_stop_mult, price + a * cfg.atr_take_mult
+        stop = round_to_step(price - a * cfg.atr_stop_mult, filters["tick_size"])
+        take = round_to_step(price + a * cfg.atr_take_mult, filters["tick_size"])
         bracket = client.place_oco_order(symbol, "SELL", qty, take_profit_price=take, stop_price=stop, stop_limit_price=stop)
         open_count += 1
         LOG.info("opened %s qty=%s entry=%.8f stop=%.8f take=%.8f", symbol, qty, price, stop, take)

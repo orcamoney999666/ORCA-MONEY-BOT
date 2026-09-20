@@ -76,6 +76,31 @@ decisions — `RegimeStrategy` has no logic yet for deciding when to convert bet
 and inventing that trigger without a stated strategy would be guessing, not engineering.
 Wiring it into the autonomous loop is a future phase if/when that strategy is defined.
 
+## Full order/account parity (added this session)
+
+Scope for this pass: everything a spot-trading user can do **except withdrawing or
+transferring funds off the account** — those are a fundamentally different risk category
+(irreversible, moves money outside the exchange) and are intentionally not implemented.
+
+New on `BinanceREST`, verified against Binance's official docs:
+
+- `place_limit_order`, `place_stop_loss_limit_order`, `place_take_profit_limit_order` —
+  standalone order types alongside the existing `market_order` and OCO bracket
+  (`place_oco_order`). All gated to `Mode.LIVE`.
+- `cancel_all_open_orders(symbol)` — flatten every open order on a symbol in one call.
+- `get_all_orders(symbol)` / `get_my_trades(symbol)` — full order history and actual
+  fills/executions (what a user sees under Order History / Trade History).
+- `get_exchange_info(symbol)` / `get_symbol_filters(symbol)` — public, unsigned; a
+  symbol's real trading rules (lot size step, price tick size, minimum notional).
+- `round_to_step(value, step)` — rounds a computed quantity/price down to the exchange's
+  actual precision.
+
+**Wired into `live`:** each cycle now fetches the symbol's filters and rounds the order
+quantity to the lot-size step before sending it, and rejects (`no-trade`, reason
+`below-min-qty` / `below-min-notional`) rather than firing an order Binance would reject
+anyway. Before this, a computed quantity that violated `LOT_SIZE`/`NOTIONAL` would have
+been sent as-is and failed at Binance's end.
+
 ## التشغيل
 
 ```bash

@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import tempfile
@@ -8,7 +9,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("TRADING_MODE", "paper")
 from binance_trading_bot import (
     BinanceREST, Candle, Config, Mode, RegimeStrategy, RiskGate, Signal, atr, backtest,
-    load_risk_state, run_live, run_live_cycle, save_risk_state,
+    load_risk_state, round_to_step, run_live, run_live_cycle, save_risk_state,
 )
 
 class BotTests(unittest.TestCase):
@@ -195,6 +196,114 @@ class BinanceRESTConvertTests(unittest.TestCase):
         self.assertEqual(result["orderStatus"], "SUCCESS")
 
 
+class BinanceRESTExtraOrderTests(unittest.TestCase):
+    """Limit/stop/take-profit orders, cancel-all, history, and public trading-rule lookups."""
+
+    def test_place_limit_order_blocked_outside_live_mode(self):
+        with self.assertRaises(RuntimeError):
+            BinanceREST(Config()).place_limit_order("BTCUSDT", "BUY", 0.01, 100)
+
+    def test_place_stop_loss_limit_order_blocked_outside_live_mode(self):
+        with self.assertRaises(RuntimeError):
+            BinanceREST(Config()).place_stop_loss_limit_order("BTCUSDT", "SELL", 0.01, 90, 89)
+
+    def test_place_take_profit_limit_order_blocked_outside_live_mode(self):
+        with self.assertRaises(RuntimeError):
+            BinanceREST(Config()).place_take_profit_limit_order("BTCUSDT", "SELL", 0.01, 110, 111)
+
+    def test_cancel_all_open_orders_blocked_outside_live_mode(self):
+        with self.assertRaises(RuntimeError):
+            BinanceREST(Config()).cancel_all_open_orders("BTCUSDT")
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_place_limit_order_sends_post(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"status": "NEW"}')
+        BinanceREST(_live_config()).place_limit_order("BTCUSDT", "BUY", 0.01, 100, time_in_force="GTC")
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("type=LIMIT", request.full_url)
+        self.assertIn("timeInForce=GTC", request.full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_place_stop_loss_limit_order_sends_post(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"status": "NEW"}')
+        BinanceREST(_live_config()).place_stop_loss_limit_order("BTCUSDT", "SELL", 0.01, stop_price=90, limit_price=89)
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("type=STOP_LOSS_LIMIT", request.full_url)
+        self.assertIn("stopPrice=90", request.full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_place_take_profit_limit_order_sends_post(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"status": "NEW"}')
+        BinanceREST(_live_config()).place_take_profit_limit_order("BTCUSDT", "SELL", 0.01, stop_price=110, limit_price=111)
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("type=TAKE_PROFIT_LIMIT", request.full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_cancel_all_open_orders_sends_delete(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b"[]")
+        BinanceREST(_live_config()).cancel_all_open_orders("BTCUSDT")
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertIn("/api/v3/openOrders?", request.full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_get_all_orders_sends_get(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b"[]")
+        result = BinanceREST(_live_config()).get_all_orders("BTCUSDT")
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertIn("/api/v3/allOrders?", request.full_url)
+        self.assertEqual(result, [])
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_get_my_trades_sends_get(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'[{"price": "100"}]')
+        result = BinanceREST(_live_config()).get_my_trades("BTCUSDT")
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertIn("/api/v3/myTrades?", request.full_url)
+        self.assertEqual(result[0]["price"], "100")
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_get_exchange_info_is_unsigned_get(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"symbols": []}')
+        BinanceREST(Config()).get_exchange_info("BTCUSDT")
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertNotIn("signature=", request.full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_get_symbol_filters_extracts_known_fields(self, mock_urlopen):
+        payload = json.dumps({"symbols": [{"filters": [
+            {"filterType": "LOT_SIZE", "stepSize": "0.00010000", "minQty": "0.00010000", "maxQty": "9000.0"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01000000"},
+            {"filterType": "NOTIONAL", "minNotional": "5.00000000"},
+        ]}]}).encode()
+        mock_urlopen.return_value = _mock_response(payload)
+        filters = BinanceREST(Config()).get_symbol_filters("BTCUSDT")
+        self.assertEqual(filters["step_size"], 0.0001)
+        self.assertEqual(filters["min_qty"], 0.0001)
+        self.assertEqual(filters["tick_size"], 0.01)
+        self.assertEqual(filters["min_notional"], 5.0)
+
+
+class RoundToStepTests(unittest.TestCase):
+    def test_rounds_down_to_nearest_step(self):
+        self.assertEqual(round_to_step(0.123456, 0.001), 0.123)
+
+    def test_none_step_is_a_no_op(self):
+        self.assertEqual(round_to_step(0.123456, None), 0.123456)
+
+    def test_zero_step_is_a_no_op(self):
+        self.assertEqual(round_to_step(0.123456, 0), 0.123456)
+
+    def test_already_aligned_value_is_unchanged(self):
+        self.assertEqual(round_to_step(1.5, 0.5), 1.5)
+
+
 class RiskStatePersistenceTests(unittest.TestCase):
     def test_state_dict_round_trips_through_restore(self):
         gate = RiskGate(Config())
@@ -229,10 +338,13 @@ class RiskStatePersistenceTests(unittest.TestCase):
 class LiveCycleTests(unittest.TestCase):
     """run_live_cycle is one pass; the network is always a MagicMock(spec=BinanceREST)."""
 
-    def _client(self, candles, open_orders=None):
+    def _client(self, candles, open_orders=None, filters=None):
         client = MagicMock(spec=BinanceREST)
         client.get_open_orders.return_value = open_orders or []
         client.klines.return_value = candles
+        client.get_symbol_filters.return_value = filters or {
+            "step_size": None, "min_qty": None, "tick_size": None, "min_notional": None,
+        }
         client.market_order.return_value = {"status": "FILLED"}
         client.place_oco_order.return_value = {"orderListId": 1}
         return client
@@ -261,6 +373,23 @@ class LiveCycleTests(unittest.TestCase):
         self.assertEqual(client.market_order.call_args[0][1], "BUY")
         client.place_oco_order.assert_called_once()
         self.assertEqual(client.place_oco_order.call_args[0][1], "SELL")
+
+    def test_order_quantity_is_rounded_to_lot_size_before_sending(self):
+        cfg = _live_config(symbols=("BTCUSDT",), risk_per_trade_pct=1.7)
+        filters = {"step_size": 0.001, "min_qty": 0.001, "tick_size": 0.01, "min_notional": None}
+        client = self._client(_trending_candles(rising=True), filters=filters)
+        run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        sent_qty = client.market_order.call_args[0][2]
+        # Tolerant of float noise: assert sent_qty lands on the step grid, not exact `%` == 0.
+        self.assertAlmostEqual(sent_qty / 0.001, round(sent_qty / 0.001), places=6)
+
+    def test_below_min_notional_is_rejected_before_sending(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        filters = {"step_size": None, "min_qty": None, "tick_size": None, "min_notional": 10_000_000}
+        client = self._client(_trending_candles(rising=True), filters=filters)
+        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        self.assertEqual(result["results"][0]["reason"], "below-min-notional")
+        client.market_order.assert_not_called()
 
     def test_no_data_is_skipped_not_crashed(self):
         cfg = _live_config(symbols=("BTCUSDT",))

@@ -58,6 +58,24 @@ export LIVE_TRADING_CONFIRM=I_UNDERSTAND_RISK
 python3 binance_trading_bot.py live
 ```
 
+## Direct asset conversion (added this session)
+
+Verified against Binance's official Convert API docs, not memory. `BinanceREST` now also
+supports converting one asset straight into another — the same "Convert" swap a user does
+in the Binance app, no order book involved:
+
+- `get_convert_quote(from_asset, to_asset, from_amount)` — get a firm, time-limited quote.
+  Read-only: works in any mode with valid API keys, quoting does not move funds.
+- `accept_convert_quote(quote_id)` — execute a previously fetched quote. Gated to `Mode.LIVE`.
+- `get_convert_order_status(order_id=..., quote_id=...)` — check a conversion's status.
+- `convert(from_asset, to_asset, from_amount)` — quote + accept in one call, gated to `Mode.LIVE`.
+
+This is exposed as a primitive on `BinanceREST`, callable directly (e.g. from a script or a
+REPL) exactly like a manual trade. It is **not** wired into the `live` loop's automatic
+decisions — `RegimeStrategy` has no logic yet for deciding when to convert between assets,
+and inventing that trigger without a stated strategy would be guessing, not engineering.
+Wiring it into the autonomous loop is a future phase if/when that strategy is defined.
+
 ## التشغيل
 
 ```bash

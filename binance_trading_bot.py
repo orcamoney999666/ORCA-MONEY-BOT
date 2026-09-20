@@ -176,6 +176,32 @@ class BinanceREST:
     def get_order(self, symbol: str, order_id: int) -> dict:
         return self._request("/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True)
 
+    def get_convert_quote(self, from_asset: str, to_asset: str, from_amount: float, valid_time: str = "10s") -> dict:
+        """Firm, time-limited quote to swap one asset directly into another — Binance's
+        Convert feature, the same swap a user gets tapping 'Convert' in the app.
+        Read-only: getting a quote does not move any funds."""
+        params = {"fromAsset": from_asset, "toAsset": to_asset, "fromAmount": f"{from_amount:.8f}", "validTime": valid_time}
+        return self._request("/sapi/v1/convert/getQuote", params, signed=True, method="POST")
+
+    def accept_convert_quote(self, quote_id: str) -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("accept_convert_quote is disabled outside live mode")
+        return self._request("/sapi/v1/convert/acceptQuote", {"quoteId": quote_id}, signed=True, method="POST")
+
+    def get_convert_order_status(self, order_id: str | None = None, quote_id: str | None = None) -> dict:
+        if not order_id and not quote_id:
+            raise ValueError("get_convert_order_status requires order_id or quote_id")
+        params = {"orderId": order_id} if order_id else {"quoteId": quote_id}
+        return self._request("/sapi/v1/convert/orderStatus", params, signed=True)
+
+    def convert(self, from_asset: str, to_asset: str, from_amount: float) -> dict:
+        """One-step convert: quote then immediately accept, like a single tap of
+        'Convert' in the Binance app. Moves real funds; live mode only."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("convert is disabled outside live mode")
+        quote = self.get_convert_quote(from_asset, to_asset, from_amount)
+        return self.accept_convert_quote(quote["quoteId"])
+
 
 def sma(values: list[float], period: int) -> Optional[float]:
     return sum(values[-period:]) / period if len(values) >= period else None

@@ -137,6 +137,64 @@ class BinanceRESTOrderTests(unittest.TestCase):
         self.assertEqual(result["status"], "NEW")
 
 
+class BinanceRESTConvertTests(unittest.TestCase):
+    """Direct asset-to-asset conversion (Binance's Convert feature)."""
+
+    def test_accept_convert_quote_blocked_outside_live_mode(self):
+        client = BinanceREST(Config())
+        with self.assertRaises(RuntimeError):
+            client.accept_convert_quote("quote-1")
+
+    def test_convert_blocked_outside_live_mode(self):
+        client = BinanceREST(Config())
+        with self.assertRaises(RuntimeError):
+            client.convert("BTC", "ETH", 0.01)
+
+    def test_get_convert_order_status_requires_an_id(self):
+        client = BinanceREST(_live_config())
+        with self.assertRaises(ValueError):
+            client.get_convert_order_status()
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_get_convert_quote_sends_post_to_correct_endpoint(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"quoteId": "q1", "toAmount": "0.5"}')
+        result = BinanceREST(_live_config()).get_convert_quote("BTC", "ETH", 0.01)
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("/sapi/v1/convert/getQuote?", request.full_url)
+        self.assertIn("fromAsset=BTC", request.full_url)
+        self.assertIn("toAsset=ETH", request.full_url)
+        self.assertEqual(result["quoteId"], "q1")
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_accept_convert_quote_sends_post(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"orderId": "o1", "orderStatus": "SUCCESS"}')
+        result = BinanceREST(_live_config()).accept_convert_quote("q1")
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("/sapi/v1/convert/acceptQuote?", request.full_url)
+        self.assertIn("quoteId=q1", request.full_url)
+        self.assertEqual(result["orderStatus"], "SUCCESS")
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_get_convert_order_status_sends_get(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"orderStatus": "SUCCESS"}')
+        BinanceREST(_live_config()).get_convert_order_status(order_id="o1")
+        request = mock_urlopen.call_args[0][0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertIn("orderId=o1", request.full_url)
+
+    @patch.object(BinanceREST, "accept_convert_quote")
+    @patch.object(BinanceREST, "get_convert_quote")
+    def test_convert_quotes_then_accepts_the_returned_quote_id(self, mock_quote, mock_accept):
+        mock_quote.return_value = {"quoteId": "q-42", "toAmount": "1.23"}
+        mock_accept.return_value = {"orderId": "o-1", "orderStatus": "SUCCESS"}
+        result = BinanceREST(_live_config()).convert("BTC", "ETH", 0.01)
+        mock_quote.assert_called_once_with("BTC", "ETH", 0.01)
+        mock_accept.assert_called_once_with("q-42")
+        self.assertEqual(result["orderStatus"], "SUCCESS")
+
+
 class RiskStatePersistenceTests(unittest.TestCase):
     def test_state_dict_round_trips_through_restore(self):
         gate = RiskGate(Config())

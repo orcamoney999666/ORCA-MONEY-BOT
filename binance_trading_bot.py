@@ -112,14 +112,14 @@ class BinanceREST:
         self.cfg = cfg
         self.base = "https://testnet.binance.vision" if cfg.mode is Mode.TESTNET else "https://api.binance.com"
 
-    def _request(self, path: str, params: dict[str, object] | None = None, signed: bool = False):
+    def _request(self, path: str, params: dict[str, object] | None = None, signed: bool = False, method: str = "GET"):
         params = dict(params or {})
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             query = urllib.parse.urlencode(params)
             params["signature"] = hmac.new(self.cfg.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         query = urllib.parse.urlencode(params)
-        req = urllib.request.Request(f"{self.base}{path}?{query}", headers={"X-MBX-APIKEY": self.cfg.api_key})
+        req = urllib.request.Request(f"{self.base}{path}?{query}", headers={"X-MBX-APIKEY": self.cfg.api_key}, method=method)
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
 
@@ -131,9 +131,46 @@ class BinanceREST:
         return self._request("/api/v3/account", signed=True)
 
     def market_order(self, symbol: str, side: str, quantity: float) -> dict:
+        """Real market buy/sell. Binance side must be 'BUY' or 'SELL'."""
         if self.cfg.mode is not Mode.LIVE:
             raise RuntimeError("market_order is disabled outside live mode")
-        return self._request("/api/v3/order", {"symbol": symbol, "side": side, "type": "MARKET", "quantity": f"{quantity:.8f}"}, signed=True)
+        params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": f"{quantity:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def place_oco_order(self, symbol: str, side: str, quantity: float, take_profit_price: float, stop_price: float, stop_limit_price: float, stop_limit_time_in_force: str = "GTC") -> dict:
+        """Real stop-loss + take-profit bracket as a single Binance OCO order.
+
+        side is the side that closes the position (e.g. 'SELL' to exit a long).
+        take_profit_price is the limit leg; stop_price/stop_limit_price are the stop leg.
+        """
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_oco_order is disabled outside live mode")
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": f"{quantity:.8f}",
+            "price": f"{take_profit_price:.8f}",
+            "stopPrice": f"{stop_price:.8f}",
+            "stopLimitPrice": f"{stop_limit_price:.8f}",
+            "stopLimitTimeInForce": stop_limit_time_in_force,
+        }
+        return self._request("/api/v3/order/oco", params, signed=True, method="POST")
+
+    def cancel_order(self, symbol: str, order_id: int) -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("cancel_order is disabled outside live mode")
+        return self._request("/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True, method="DELETE")
+
+    def cancel_oco_order(self, symbol: str, order_list_id: int) -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("cancel_oco_order is disabled outside live mode")
+        return self._request("/api/v3/orderList", {"symbol": symbol, "orderListId": order_list_id}, signed=True, method="DELETE")
+
+    def get_open_orders(self, symbol: str) -> list[dict]:
+        return self._request("/api/v3/openOrders", {"symbol": symbol}, signed=True)
+
+    def get_order(self, symbol: str, order_id: int) -> dict:
+        return self._request("/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True)
 
 
 def sma(values: list[float], period: int) -> Optional[float]:

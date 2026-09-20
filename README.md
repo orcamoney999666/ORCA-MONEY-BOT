@@ -12,6 +12,19 @@
 - إضافة Paper Broker واختبار تاريخي CSV ومقاييس أولية.
 - جعل الاتصال بـ Binance اختياريًا؛ لا حاجة إلى Redis/PostgreSQL لتشغيل الاختبارات.
 
+## Real order execution (added this session)
+
+`BinanceREST` now supports genuine live order management, not just market data:
+
+- `market_order(symbol, side, quantity)` — real market buy/sell (fixed a bug: it was silently sending `GET` instead of `POST`, so it would have failed against the real API).
+- `place_oco_order(symbol, side, quantity, take_profit_price, stop_price, stop_limit_price)` — real stop-loss + take-profit as one Binance OCO bracket order.
+- `cancel_order` / `cancel_oco_order` — cancel a single order or an OCO pair.
+- `get_open_orders` / `get_order` — check live order state.
+
+All mutating calls (`market_order`, `place_oco_order`, `cancel_order`, `cancel_oco_order`) stay hard-gated to `Mode.LIVE`, exactly like before — paper mode never touches the real API. Covered by mocked unit tests in `test_bot.py` (no network calls or credentials needed to run the suite).
+
+Not yet wired up: an autonomous live trading loop that calls these automatically from `RegimeStrategy`/`RiskGate` signals — that is a separate, later phase.
+
 ## التشغيل
 
 ```bash

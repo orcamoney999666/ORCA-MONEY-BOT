@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -56,12 +57,16 @@ class Config:
     api_secret: str = os.getenv("BINANCE_API_SECRET", "")
     live_confirmation: str = os.getenv("LIVE_TRADING_CONFIRM", "")
     db_path: Path = Path(os.getenv("TRADES_DB_PATH", "data/trades.jsonl"))
+    risk_state_path: Path = Path(os.getenv("RISK_STATE_PATH", "data/risk_state.json"))
+    live_poll_seconds: int = int(os.getenv("LIVE_POLL_SECONDS", "60"))
 
     def validate(self) -> None:
         if not self.symbols or any(not symbol.isalnum() for symbol in self.symbols):
             raise ValueError("SYMBOLS must contain valid alphanumeric Binance symbols")
         if self.initial_equity <= 0 or self.max_open_positions < 1 or self.max_trades_per_hour < 1:
             raise ValueError("Initial equity and trade limits must be positive")
+        if self.live_poll_seconds < 5:
+            raise ValueError("LIVE_POLL_SECONDS must be >= 5")
         if self.atr_period < 2 or self.atr_stop_mult <= 0 or self.atr_take_mult <= 0:
             raise ValueError("ATR settings must be positive")
         if self.risk_per_trade_pct <= 0 or self.risk_per_trade_pct > 2:
@@ -112,14 +117,14 @@ class BinanceREST:
         self.cfg = cfg
         self.base = "https://testnet.binance.vision" if cfg.mode is Mode.TESTNET else "https://api.binance.com"
 
-    def _request(self, path: str, params: dict[str, object] | None = None, signed: bool = False):
+    def _request(self, path: str, params: dict[str, object] | None = None, signed: bool = False, method: str = "GET"):
         params = dict(params or {})
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             query = urllib.parse.urlencode(params)
             params["signature"] = hmac.new(self.cfg.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         query = urllib.parse.urlencode(params)
-        req = urllib.request.Request(f"{self.base}{path}?{query}", headers={"X-MBX-APIKEY": self.cfg.api_key})
+        req = urllib.request.Request(f"{self.base}{path}?{query}", headers={"X-MBX-APIKEY": self.cfg.api_key}, method=method)
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
 
@@ -131,9 +136,137 @@ class BinanceREST:
         return self._request("/api/v3/account", signed=True)
 
     def market_order(self, symbol: str, side: str, quantity: float) -> dict:
+        """Real market buy/sell. Binance side must be 'BUY' or 'SELL'."""
         if self.cfg.mode is not Mode.LIVE:
             raise RuntimeError("market_order is disabled outside live mode")
-        return self._request("/api/v3/order", {"symbol": symbol, "side": side, "type": "MARKET", "quantity": f"{quantity:.8f}"}, signed=True)
+        params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": f"{quantity:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def place_oco_order(self, symbol: str, side: str, quantity: float, take_profit_price: float, stop_price: float, stop_limit_price: float, stop_limit_time_in_force: str = "GTC") -> dict:
+        """Real stop-loss + take-profit bracket as a single Binance OCO order.
+
+        side is the side that closes the position (e.g. 'SELL' to exit a long).
+        take_profit_price is the limit leg; stop_price/stop_limit_price are the stop leg.
+        """
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_oco_order is disabled outside live mode")
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": f"{quantity:.8f}",
+            "price": f"{take_profit_price:.8f}",
+            "stopPrice": f"{stop_price:.8f}",
+            "stopLimitPrice": f"{stop_limit_price:.8f}",
+            "stopLimitTimeInForce": stop_limit_time_in_force,
+        }
+        return self._request("/api/v3/order/oco", params, signed=True, method="POST")
+
+    def cancel_order(self, symbol: str, order_id: int) -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("cancel_order is disabled outside live mode")
+        return self._request("/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True, method="DELETE")
+
+    def cancel_oco_order(self, symbol: str, order_list_id: int) -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("cancel_oco_order is disabled outside live mode")
+        return self._request("/api/v3/orderList", {"symbol": symbol, "orderListId": order_list_id}, signed=True, method="DELETE")
+
+    def get_open_orders(self, symbol: str) -> list[dict]:
+        return self._request("/api/v3/openOrders", {"symbol": symbol}, signed=True)
+
+    def get_order(self, symbol: str, order_id: int) -> dict:
+        return self._request("/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True)
+
+    def get_convert_quote(self, from_asset: str, to_asset: str, from_amount: float, valid_time: str = "10s") -> dict:
+        """Firm, time-limited quote to swap one asset directly into another — Binance's
+        Convert feature, the same swap a user gets tapping 'Convert' in the app.
+        Read-only: getting a quote does not move any funds."""
+        params = {"fromAsset": from_asset, "toAsset": to_asset, "fromAmount": f"{from_amount:.8f}", "validTime": valid_time}
+        return self._request("/sapi/v1/convert/getQuote", params, signed=True, method="POST")
+
+    def accept_convert_quote(self, quote_id: str) -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("accept_convert_quote is disabled outside live mode")
+        return self._request("/sapi/v1/convert/acceptQuote", {"quoteId": quote_id}, signed=True, method="POST")
+
+    def get_convert_order_status(self, order_id: str | None = None, quote_id: str | None = None) -> dict:
+        if not order_id and not quote_id:
+            raise ValueError("get_convert_order_status requires order_id or quote_id")
+        params = {"orderId": order_id} if order_id else {"quoteId": quote_id}
+        return self._request("/sapi/v1/convert/orderStatus", params, signed=True)
+
+    def convert(self, from_asset: str, to_asset: str, from_amount: float) -> dict:
+        """One-step convert: quote then immediately accept, like a single tap of
+        'Convert' in the Binance app. Moves real funds; live mode only."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("convert is disabled outside live mode")
+        quote = self.get_convert_quote(from_asset, to_asset, from_amount)
+        return self.accept_convert_quote(quote["quoteId"])
+
+    def place_limit_order(self, symbol: str, side: str, quantity: float, price: float, time_in_force: str = "GTC") -> dict:
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_limit_order is disabled outside live mode")
+        params = {"symbol": symbol, "side": side, "type": "LIMIT", "timeInForce": time_in_force,
+                  "quantity": f"{quantity:.8f}", "price": f"{price:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def place_stop_loss_limit_order(self, symbol: str, side: str, quantity: float, stop_price: float, limit_price: float, time_in_force: str = "GTC") -> dict:
+        """Standalone stop-loss order (not paired with a take-profit like place_oco_order)."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_stop_loss_limit_order is disabled outside live mode")
+        params = {"symbol": symbol, "side": side, "type": "STOP_LOSS_LIMIT", "timeInForce": time_in_force,
+                  "quantity": f"{quantity:.8f}", "price": f"{limit_price:.8f}", "stopPrice": f"{stop_price:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def place_take_profit_limit_order(self, symbol: str, side: str, quantity: float, stop_price: float, limit_price: float, time_in_force: str = "GTC") -> dict:
+        """Standalone take-profit order (not paired with a stop-loss like place_oco_order)."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("place_take_profit_limit_order is disabled outside live mode")
+        params = {"symbol": symbol, "side": side, "type": "TAKE_PROFIT_LIMIT", "timeInForce": time_in_force,
+                  "quantity": f"{quantity:.8f}", "price": f"{limit_price:.8f}", "stopPrice": f"{stop_price:.8f}"}
+        return self._request("/api/v3/order", params, signed=True, method="POST")
+
+    def cancel_all_open_orders(self, symbol: str) -> list[dict]:
+        """Flattens every open order (including OCO legs) on one symbol in a single call."""
+        if self.cfg.mode is not Mode.LIVE:
+            raise RuntimeError("cancel_all_open_orders is disabled outside live mode")
+        return self._request("/api/v3/openOrders", {"symbol": symbol}, signed=True, method="DELETE")
+
+    def get_all_orders(self, symbol: str, limit: int = 500) -> list[dict]:
+        """Full order history for a symbol (not just currently-open orders)."""
+        return self._request("/api/v3/allOrders", {"symbol": symbol, "limit": limit}, signed=True)
+
+    def get_my_trades(self, symbol: str, limit: int = 500) -> list[dict]:
+        """Actual executions/fills for a symbol — what a user sees under Trade History."""
+        return self._request("/api/v3/myTrades", {"symbol": symbol, "limit": limit}, signed=True)
+
+    def get_exchange_info(self, symbol: str | None = None) -> dict:
+        """Public endpoint: trading rules and filters. No signing needed, same as klines()."""
+        return self._request("/api/v3/exchangeInfo", {"symbol": symbol} if symbol else {})
+
+    def get_symbol_filters(self, symbol: str) -> dict:
+        """step_size/tick_size/min_qty/min_notional for one symbol, so a computed order
+        quantity or price can be rounded to what Binance will actually accept instead of
+        being rejected. Verified field names against Binance's exchangeInfo docs."""
+        info = self.get_exchange_info(symbol)
+        filters = {f["filterType"]: f for f in info["symbols"][0]["filters"]}
+        lot = filters.get("LOT_SIZE", {})
+        price_filter = filters.get("PRICE_FILTER", {})
+        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+        return {
+            "step_size": float(lot["stepSize"]) if lot.get("stepSize") else None,
+            "min_qty": float(lot["minQty"]) if lot.get("minQty") else None,
+            "tick_size": float(price_filter["tickSize"]) if price_filter.get("tickSize") else None,
+            "min_notional": float(notional["minNotional"]) if notional.get("minNotional") else None,
+        }
+
+
+def round_to_step(value: float, step: Optional[float]) -> float:
+    """Round down to the nearest multiple of step (e.g. LOT_SIZE stepSize / PRICE_FILTER
+    tickSize) so real orders aren't rejected for violating exchange precision rules."""
+    if not step:
+        return value
+    return round(math.floor(round(value / step, 8)) * step, 8)
 
 
 def sma(values: list[float], period: int) -> Optional[float]:
@@ -208,6 +341,22 @@ class RiskGate:
         self.equity += pnl; self.daily_pnl += pnl; self.peak_equity = max(self.peak_equity, self.equity); self.trades += 1
         self.trade_times.append(time.time())
 
+    def state_dict(self) -> dict:
+        return {"equity": self.equity, "peak_equity": self.peak_equity, "daily_pnl": self.daily_pnl,
+                "trades": self.trades, "day": self.day.isoformat(), "trade_times": self.trade_times}
+
+    def restore(self, state: dict) -> None:
+        """Reload persisted risk state so daily-loss/drawdown/hourly limits survive across
+        separate manual `live` invocations instead of silently resetting each run."""
+        self.equity = state.get("equity", self.equity)
+        self.peak_equity = state.get("peak_equity", self.peak_equity)
+        self.daily_pnl = state.get("daily_pnl", self.daily_pnl)
+        self.trades = state.get("trades", self.trades)
+        self.trade_times = state.get("trade_times", self.trade_times)
+        if "day" in state:
+            self.day = datetime.fromisoformat(state["day"]).date()
+        self._roll_day()
+
 
 class PaperBroker:
     def __init__(self, cfg: Config, risk: RiskGate): self.cfg, self.risk, self.positions, self.trades = cfg, risk, {}, []
@@ -246,10 +395,103 @@ def backtest(candles: list[Candle], cfg: Config) -> dict[str, float]:
     return {"trades": len(broker.trades), "pnl": round(sum(t.pnl for t in broker.trades), 8), "win_rate_pct": round(wins / len(broker.trades) * 100, 2) if broker.trades else 0.0, "profit_factor": round(gross_win / gross_loss, 4) if gross_loss else 0.0}
 
 
+def load_risk_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        LOG.warning("risk state at %s is unreadable; starting fresh", path)
+        return {}
+
+
+def save_risk_state(path: Path, risk: RiskGate) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(risk.state_dict()))
+
+
+def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: RegimeStrategy) -> dict:
+    """One real evaluate-and-act pass over every symbol.
+
+    Binance spot has no shorting: a SELL signal only ever closes a position you
+    already hold, so it is skipped here rather than sent as a broken sell-to-open.
+    Real P&L reconciliation (crediting risk.equity when a bracket actually fills)
+    is not implemented yet; this cycle only prevents opening more than
+    MAX_OPEN_POSITIONS at once.
+    """
+    open_symbols = {symbol: bool(client.get_open_orders(symbol)) for symbol in cfg.symbols}
+    open_count = sum(open_symbols.values())
+    results = []
+    for symbol in cfg.symbols:
+        if open_symbols[symbol]:
+            results.append({"symbol": symbol, "action": "skipped", "reason": "open-order-exists"})
+            continue
+        candles = client.klines(symbol)
+        if not candles:
+            results.append({"symbol": symbol, "action": "skipped", "reason": "no-data"})
+            continue
+        signal = strategy.decide(candles)
+        if signal is Signal.SELL:
+            results.append({"symbol": symbol, "action": "skipped", "reason": "spot-no-short"})
+            continue
+        price = candles[-1].close
+        a = atr(candles, cfg.atr_period)
+        ok, qty, reason = risk.approve(signal, price, a, open_count)
+        if not ok:
+            results.append({"symbol": symbol, "action": "no-trade", "reason": reason})
+            continue
+        filters = client.get_symbol_filters(symbol)
+        qty = round_to_step(qty, filters["step_size"])
+        if filters["min_qty"] and qty < filters["min_qty"]:
+            results.append({"symbol": symbol, "action": "no-trade", "reason": "below-min-qty"})
+            continue
+        if filters["min_notional"] and qty * price < filters["min_notional"]:
+            results.append({"symbol": symbol, "action": "no-trade", "reason": "below-min-notional"})
+            continue
+        order = client.market_order(symbol, "BUY", qty)
+        stop = round_to_step(price - a * cfg.atr_stop_mult, filters["tick_size"])
+        take = round_to_step(price + a * cfg.atr_take_mult, filters["tick_size"])
+        bracket = client.place_oco_order(symbol, "SELL", qty, take_profit_price=take, stop_price=stop, stop_limit_price=stop)
+        open_count += 1
+        LOG.info("opened %s qty=%s entry=%.8f stop=%.8f take=%.8f", symbol, qty, price, stop, take)
+        results.append({"symbol": symbol, "action": "opened", "order": order, "bracket": bracket})
+    return {"results": results}
+
+
+def run_live(cfg: Config, client: BinanceREST) -> None:
+    """Autonomous live loop: starts only when you run this command yourself, then
+    keeps evaluating and trading on its own every LIVE_POLL_SECONDS until you stop
+    it (Ctrl+C / SIGTERM)."""
+    if cfg.mode is not Mode.LIVE:
+        raise RuntimeError("live requires TRADING_MODE=live with LIVE_TRADING_CONFIRM set")
+    risk, strategy = RiskGate(cfg), RegimeStrategy(cfg)
+    risk.restore(load_risk_state(cfg.risk_state_path))
+    stop_requested = {"flag": False}
+
+    def _handle_stop(signum, _frame):
+        LOG.info("stop signal %s received; exiting after the current cycle", signum)
+        stop_requested["flag"] = True
+
+    signal.signal(signal.SIGINT, _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
+    LOG.info("live loop started for %s, polling every %ss — started by explicit command, not scheduled", cfg.symbols, cfg.live_poll_seconds)
+    while not stop_requested["flag"]:
+        try:
+            run_live_cycle(cfg, client, risk, strategy)
+        except Exception:
+            LOG.exception("live cycle failed; will retry next poll")
+        save_risk_state(cfg.risk_state_path, risk)
+        for _ in range(cfg.live_poll_seconds):
+            if stop_requested["flag"]:
+                break
+            time.sleep(1)
+    LOG.info("live loop stopped cleanly")
+
+
 def main() -> int:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["backtest", "fetch", "config-check"])
+    parser.add_argument("command", choices=["backtest", "fetch", "config-check", "live"])
     parser.add_argument("--csv", help="CSV columns: timestamp,open,high,low,close,volume")
     args = parser.parse_args(); cfg = Config(); cfg.validate()
     if args.command == "config-check": print(json.dumps({"mode": cfg.mode.value, "symbols": cfg.symbols, "live_enabled": cfg.mode is Mode.LIVE}, indent=2)); return 0
@@ -258,6 +500,8 @@ def main() -> int:
         print(json.dumps(backtest(load_csv(args.csv), cfg), indent=2)); return 0
     client = BinanceREST(cfg)
     if not cfg.symbols: raise SystemExit("SYMBOLS is empty")
+    if args.command == "live":
+        run_live(cfg, client); return 0
     print(json.dumps([c.__dict__ for c in client.klines(cfg.symbols[0])[-5:]], indent=2)); return 0
 
 if __name__ == "__main__": raise SystemExit(main())

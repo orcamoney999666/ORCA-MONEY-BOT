@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("TRADING_MODE", "paper")
 from binance_trading_bot import (
-    BinanceREST, Candle, Config, Mode, RegimeStrategy, RiskGate, Signal, atr, backtest,
+    BinanceError, BinanceREST, Candle, Config, Mode, RegimeStrategy, RiskGate, Signal, atr, backtest,
     load_risk_state, round_to_step, run_live, run_live_cycle, save_risk_state,
 )
 
@@ -136,6 +136,19 @@ class BinanceRESTOrderTests(unittest.TestCase):
         request = mock_urlopen.call_args[0][0]
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(result["status"], "NEW")
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_http_error_preserves_binance_body(self, mock_urlopen):
+        from urllib.error import HTTPError
+        mock_urlopen.side_effect = HTTPError("https://api.binance.com/api/v3/order", 400, "bad", {}, MagicMock(read=MagicMock(return_value=b'{"code":-2010,"msg":"insufficient balance"}')))
+        with self.assertRaises(BinanceError) as caught:
+            BinanceREST(_live_config()).get_order("BTCUSDT", 1)
+        self.assertEqual(caught.exception.code, -2010)
+        self.assertIn("insufficient balance", str(caught.exception))
+
+    def test_config_repr_does_not_expose_secret(self):
+        cfg = _live_config(api_secret="super-secret")
+        self.assertNotIn("super-secret", repr(cfg))
 
 
 class BinanceRESTConvertTests(unittest.TestCase):
@@ -396,6 +409,23 @@ class LiveCycleTests(unittest.TestCase):
         client = self._client([])
         result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
         self.assertEqual(result["results"][0]["reason"], "no-data")
+
+    def test_failed_bracket_flattens_entry(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.place_oco_order.side_effect = RuntimeError("rejected")
+        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg), {})
+        self.assertEqual(result["results"][0]["reason"], "bracket-failed-flattened")
+        self.assertEqual(client.market_order.call_count, 2)
+        self.assertEqual(client.market_order.call_args_list[-1].args[1], "SELL")
+        client.cancel_all_open_orders.assert_called_once_with("BTCUSDT")
+
+    def test_successful_entry_is_recorded_for_hourly_limit(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        risk = RiskGate(cfg)
+        run_live_cycle(cfg, client, risk, RegimeStrategy(cfg), {})
+        self.assertEqual(len(risk.trade_times), 1)
 
 
 class LiveLoopTests(unittest.TestCase):

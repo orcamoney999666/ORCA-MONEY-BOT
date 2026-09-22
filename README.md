@@ -12,6 +12,21 @@
 - إضافة Paper Broker واختبار تاريخي CSV ومقاييس أولية.
 - جعل الاتصال بـ Binance اختياريًا؛ لا حاجة إلى Redis/PostgreSQL لتشغيل الاختبارات.
 
+## Phase 2 safety hardening (in progress)
+
+The live path now reads the real quote-asset balance before sizing, caps order notional
+with `MAX_NOTIONAL_PCT`, records entries for the hourly limit, persists a position ledger,
+and reconciles observed closing fills before removing a position. If the protective OCO
+fails after an entry, the bot attempts to cancel remaining orders and flatten the entry
+instead of silently carrying an unprotected position. Binance HTTP errors retain their
+exchange code/message, credentials are excluded from `Config` repr, risk/position files
+are replaced atomically, and symbol filters are cached for one hour.
+
+This does **not** complete Oracle or authorize live trading. The position reconciliation
+still depends on observable Binance trade history and must be validated on Testnet before
+any real account is considered. The live loop stops after a fatal Binance error or five
+consecutive failures rather than retrying indefinitely.
+
 ## Real order execution (added this session)
 
 `BinanceREST` now supports genuine live order management, not just market data:

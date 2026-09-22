@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from binance_trading_bot import Config, BinanceREST, RegimeStrategy, atr, backtest, load_csv
+from binance_trading_bot import Config, BinanceREST, RegimeStrategy, atr, backtest, load_csv, load_positions
 
 MAX_LINE_BYTES = 256 * 1024
 MAX_CANDLES = 1000
@@ -86,7 +86,7 @@ def main() -> int:
                 from binance_trading_bot import RiskGate, run_live_cycle
                 cfg.validate()
                 client = client or BinanceREST(cfg)
-                result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+                result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg), load_positions(cfg.positions_path))
             else:
                 raise ValueError(f"unknown command: {command}")
             print(json.dumps({"ok": True, "result": result}, default=str), flush=True)

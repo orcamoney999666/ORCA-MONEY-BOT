@@ -16,15 +16,27 @@ import math
 import os
 import signal
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 LOG = logging.getLogger("orca")
+
+
+class BinanceError(RuntimeError):
+    """Structured Binance API failure, preserving the exchange error body."""
+    def __init__(self, status: int, code: int | None, message: str, path: str):
+        super().__init__(f"{path} -> HTTP {status} Binance code={code}: {message}")
+        self.status, self.code, self.message, self.path = status, code, message, path
+
+    @property
+    def is_fatal(self) -> bool:
+        return self.status in (401, 403, 418) or self.code in (-1022, -2014, -2015)
 
 
 class Mode(str, Enum):
@@ -41,24 +53,26 @@ class Signal(str, Enum):
 
 @dataclass(frozen=True)
 class Config:
-    mode: Mode = Mode(os.getenv("TRADING_MODE", "paper").lower())
-    symbols: tuple[str, ...] = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip())
-    quote_asset: str = os.getenv("QUOTE_ASSET", "USDT")
-    initial_equity: float = float(os.getenv("PAPER_START_BALANCE", "10000"))
-    risk_per_trade_pct: float = float(os.getenv("RISK_PER_TRADE_PCT", "0.25"))
-    max_daily_loss_pct: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "2"))
-    max_drawdown_pct: float = float(os.getenv("MAX_DRAWDOWN_PCT", "10"))
-    max_open_positions: int = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-    max_trades_per_hour: int = int(os.getenv("MAX_TRADES_PER_HOUR", "6"))
-    atr_period: int = int(os.getenv("ATR_PERIOD", "14"))
-    atr_stop_mult: float = float(os.getenv("ATR_STOP_MULTIPLIER", "1.5"))
-    atr_take_mult: float = float(os.getenv("ATR_TAKE_MULTIPLIER", "3"))
-    api_key: str = os.getenv("BINANCE_API_KEY", "")
-    api_secret: str = os.getenv("BINANCE_API_SECRET", "")
-    live_confirmation: str = os.getenv("LIVE_TRADING_CONFIRM", "")
-    db_path: Path = Path(os.getenv("TRADES_DB_PATH", "data/trades.jsonl"))
-    risk_state_path: Path = Path(os.getenv("RISK_STATE_PATH", "data/risk_state.json"))
-    live_poll_seconds: int = int(os.getenv("LIVE_POLL_SECONDS", "60"))
+    mode: Mode = field(default_factory=lambda: Mode(os.getenv("TRADING_MODE", "paper").lower()))
+    symbols: tuple[str, ...] = field(default_factory=lambda: tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()))
+    quote_asset: str = field(default_factory=lambda: os.getenv("QUOTE_ASSET", "USDT"))
+    initial_equity: float = field(default_factory=lambda: float(os.getenv("PAPER_START_BALANCE", "10000")))
+    risk_per_trade_pct: float = field(default_factory=lambda: float(os.getenv("RISK_PER_TRADE_PCT", "0.25")))
+    max_daily_loss_pct: float = field(default_factory=lambda: float(os.getenv("MAX_DAILY_LOSS_PCT", "2")))
+    max_drawdown_pct: float = field(default_factory=lambda: float(os.getenv("MAX_DRAWDOWN_PCT", "10")))
+    max_notional_pct: float = field(default_factory=lambda: float(os.getenv("MAX_NOTIONAL_PCT", "20")))
+    max_open_positions: int = field(default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "3")))
+    max_trades_per_hour: int = field(default_factory=lambda: int(os.getenv("MAX_TRADES_PER_HOUR", "6")))
+    atr_period: int = field(default_factory=lambda: int(os.getenv("ATR_PERIOD", "14")))
+    atr_stop_mult: float = field(default_factory=lambda: float(os.getenv("ATR_STOP_MULTIPLIER", "1.5")))
+    atr_take_mult: float = field(default_factory=lambda: float(os.getenv("ATR_TAKE_MULTIPLIER", "3")))
+    api_key: str = field(default_factory=lambda: os.getenv("BINANCE_API_KEY", ""), repr=False)
+    api_secret: str = field(default_factory=lambda: os.getenv("BINANCE_API_SECRET", ""), repr=False)
+    live_confirmation: str = field(default_factory=lambda: os.getenv("LIVE_TRADING_CONFIRM", ""), repr=False)
+    db_path: Path = field(default_factory=lambda: Path(os.getenv("TRADES_DB_PATH", "data/trades.jsonl")))
+    risk_state_path: Path = field(default_factory=lambda: Path(os.getenv("RISK_STATE_PATH", "data/risk_state.json")))
+    positions_path: Path = field(default_factory=lambda: Path(os.getenv("POSITIONS_PATH", "data/positions.json")))
+    live_poll_seconds: int = field(default_factory=lambda: int(os.getenv("LIVE_POLL_SECONDS", "60")))
 
     def validate(self) -> None:
         if not self.symbols or any(not symbol.isalnum() for symbol in self.symbols):
@@ -71,6 +85,8 @@ class Config:
             raise ValueError("ATR settings must be positive")
         if self.risk_per_trade_pct <= 0 or self.risk_per_trade_pct > 2:
             raise ValueError("RISK_PER_TRADE_PCT must be > 0 and <= 2")
+        if self.max_daily_loss_pct <= 0 or self.max_drawdown_pct <= 0 or self.max_notional_pct <= 0:
+            raise ValueError("loss, drawdown, and notional limits must be positive")
         if self.mode is Mode.LIVE and self.live_confirmation != "I_UNDERSTAND_RISK":
             raise ValueError("Live trading is locked. Set LIVE_TRADING_CONFIRM=I_UNDERSTAND_RISK explicitly.")
         if self.mode in (Mode.TESTNET, Mode.LIVE) and (not self.api_key or not self.api_secret):
@@ -116,6 +132,7 @@ class BinanceREST:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.base = "https://testnet.binance.vision" if cfg.mode is Mode.TESTNET else "https://api.binance.com"
+        self._filters_cache: dict[str, tuple[float, dict]] = {}
 
     def _request(self, path: str, params: dict[str, object] | None = None, signed: bool = False, method: str = "GET"):
         params = dict(params or {})
@@ -125,8 +142,17 @@ class BinanceREST:
             params["signature"] = hmac.new(self.cfg.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         query = urllib.parse.urlencode(params)
         req = urllib.request.Request(f"{self.base}{path}?{query}", headers={"X-MBX-APIKEY": self.cfg.api_key}, method=method)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")
+            try:
+                payload = json.loads(body)
+                code, message = payload.get("code"), payload.get("msg", body)
+            except json.JSONDecodeError:
+                code, message = None, body
+            raise BinanceError(exc.code, code, message, path) from exc
 
     def klines(self, symbol: str, interval: str = "1h", limit: int = 300) -> list[Candle]:
         rows = self._request("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
@@ -135,11 +161,13 @@ class BinanceREST:
     def account(self) -> dict:
         return self._request("/api/v3/account", signed=True)
 
-    def market_order(self, symbol: str, side: str, quantity: float) -> dict:
+    def market_order(self, symbol: str, side: str, quantity: float, client_order_id: str | None = None) -> dict:
         """Real market buy/sell. Binance side must be 'BUY' or 'SELL'."""
         if self.cfg.mode is not Mode.LIVE:
             raise RuntimeError("market_order is disabled outside live mode")
         params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": f"{quantity:.8f}"}
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return self._request("/api/v3/order", params, signed=True, method="POST")
 
     def place_oco_order(self, symbol: str, side: str, quantity: float, take_profit_price: float, stop_price: float, stop_limit_price: float, stop_limit_time_in_force: str = "GTC") -> dict:
@@ -248,17 +276,22 @@ class BinanceREST:
         """step_size/tick_size/min_qty/min_notional for one symbol, so a computed order
         quantity or price can be rounded to what Binance will actually accept instead of
         being rejected. Verified field names against Binance's exchangeInfo docs."""
+        cached = self._filters_cache.get(symbol)
+        if cached and time.time() - cached[0] < 3600:
+            return dict(cached[1])
         info = self.get_exchange_info(symbol)
         filters = {f["filterType"]: f for f in info["symbols"][0]["filters"]}
         lot = filters.get("LOT_SIZE", {})
         price_filter = filters.get("PRICE_FILTER", {})
         notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
-        return {
+        result = {
             "step_size": float(lot["stepSize"]) if lot.get("stepSize") else None,
             "min_qty": float(lot["minQty"]) if lot.get("minQty") else None,
             "tick_size": float(price_filter["tickSize"]) if price_filter.get("tickSize") else None,
             "min_notional": float(notional["minNotional"]) if notional.get("minNotional") else None,
         }
+        self._filters_cache[symbol] = (time.time(), result)
+        return dict(result)
 
 
 def round_to_step(value: float, step: Optional[float]) -> float:
@@ -336,6 +369,10 @@ class RiskGate:
         qty = (self.equity * self.cfg.risk_per_trade_pct / 100) / stop_distance
         return (qty > 0, qty, "approved" if qty > 0 else "invalid-size")
 
+    def opened(self) -> None:
+        """Record an accepted entry so hourly limits apply before the exit."""
+        self._roll_day(); self._trim_hour(); self.trade_times.append(time.time())
+
     def closed(self, pnl: float) -> None:
         self._roll_day()
         self.equity += pnl; self.daily_pnl += pnl; self.peak_equity = max(self.peak_equity, self.equity); self.trades += 1
@@ -407,19 +444,84 @@ def load_risk_state(path: Path) -> dict:
 
 def save_risk_state(path: Path, risk: RiskGate) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(risk.state_dict()))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(risk.state_dict()))
+    tmp.replace(path)
 
 
-def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: RegimeStrategy) -> dict:
+def load_positions(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        LOG.warning("positions at %s is unreadable; refusing new entries", path)
+        return {"__unreadable__": True}
+
+
+def save_positions(path: Path, positions: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(positions))
+    tmp.replace(path)
+
+
+def reconcile_position(client: BinanceREST, symbol: str, position: dict) -> Optional[float]:
+    """Return realized P&L only when a closing sell fill is observable."""
+    trades = client.get_my_trades(symbol)
+    if not isinstance(trades, list):
+        return None
+    since = int(position.get("opened_at_ms", 0))
+    relevant = [t for t in trades if int(t.get("time", 0)) >= since]
+    sells = [t for t in relevant if not bool(t.get("isBuyer"))]
+    if not sells:
+        return None
+    buys = [t for t in relevant if bool(t.get("isBuyer"))]
+    buy_cost = sum(float(t.get("quoteQty", float(t.get("price", 0)) * float(t.get("qty", 0)))) for t in buys)
+    sell_value = sum(float(t.get("quoteQty", float(t.get("price", 0)) * float(t.get("qty", 0)))) for t in sells)
+    commission = sum(float(t.get("commission", 0)) for t in relevant if t.get("commissionAsset") == position.get("quote_asset"))
+    return sell_value - buy_cost - commission
+
+
+def live_equity(client: BinanceREST, quote_asset: str) -> Optional[float]:
+    """Return the actual quote-asset balance; paper mode remains config-backed."""
+    account = client.account()
+    if not isinstance(account, dict):
+        return None
+    for balance in account.get("balances", []):
+        if balance.get("asset") == quote_asset:
+            return float(balance.get("free", 0)) + float(balance.get("locked", 0))
+    return 0.0
+
+
+def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: RegimeStrategy, positions: Optional[dict] = None) -> dict:
     """One real evaluate-and-act pass over every symbol.
 
     Binance spot has no shorting: a SELL signal only ever closes a position you
     already hold, so it is skipped here rather than sent as a broken sell-to-open.
-    Real P&L reconciliation (crediting risk.equity when a bracket actually fills)
-    is not implemented yet; this cycle only prevents opening more than
-    MAX_OPEN_POSITIONS at once.
+    A persisted position ledger is reconciled against observed trade history so
+    realized P&L can update RiskGate after a bracket closes. The ledger is also
+    used to prevent duplicate entries across restarts.
     """
-    open_symbols = {symbol: bool(client.get_open_orders(symbol)) for symbol in cfg.symbols}
+    if positions is None:
+        # The resident live loop owns the persisted ledger; direct callers may
+        # pass one explicitly. This keeps one-shot paper/mock calls isolated.
+        positions = {}
+    ledger_unreadable = positions.get("__unreadable__") is True
+    if cfg.mode is Mode.LIVE:
+        actual_equity = live_equity(client, cfg.quote_asset)
+        if actual_equity is not None:
+            risk.equity = actual_equity
+            risk.peak_equity = max(risk.peak_equity, actual_equity)
+    for symbol, position in list(positions.items()):
+        if symbol.startswith("__"):
+            continue
+        pnl = reconcile_position(client, symbol, position)
+        if pnl is not None:
+            risk.closed(pnl)
+            del positions[symbol]
+    open_symbols = {symbol: bool(client.get_open_orders(symbol)) or symbol in positions for symbol in cfg.symbols}
     open_count = sum(open_symbols.values())
     results = []
     for symbol in cfg.symbols:
@@ -437,9 +539,14 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
         price = candles[-1].close
         a = atr(candles, cfg.atr_period)
         ok, qty, reason = risk.approve(signal, price, a, open_count)
+        if ledger_unreadable:
+            results.append({"symbol": symbol, "action": "no-trade", "reason": "positions-state-unreadable"})
+            continue
         if not ok:
             results.append({"symbol": symbol, "action": "no-trade", "reason": reason})
             continue
+        max_notional = risk.equity * cfg.max_notional_pct / 100
+        qty = min(qty, max_notional / price) if max_notional > 0 else 0.0
         filters = client.get_symbol_filters(symbol)
         qty = round_to_step(qty, filters["step_size"])
         if filters["min_qty"] and qty < filters["min_qty"]:
@@ -448,13 +555,41 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
         if filters["min_notional"] and qty * price < filters["min_notional"]:
             results.append({"symbol": symbol, "action": "no-trade", "reason": "below-min-notional"})
             continue
-        order = client.market_order(symbol, "BUY", qty)
+        client_order_id = f"orca-{symbol}-{int(time.time() * 1000)}"
+        order = client.market_order(symbol, "BUY", qty, client_order_id=client_order_id)
+        filled = float(order.get("executedQty", qty) or 0) if isinstance(order, dict) else qty
+        if filled <= 0:
+            results.append({"symbol": symbol, "action": "aborted", "reason": "entry-not-filled"})
+            continue
+        filled = round_to_step(filled, filters["step_size"])
         stop = round_to_step(price - a * cfg.atr_stop_mult, filters["tick_size"])
         take = round_to_step(price + a * cfg.atr_take_mult, filters["tick_size"])
-        bracket = client.place_oco_order(symbol, "SELL", qty, take_profit_price=take, stop_price=stop, stop_limit_price=stop)
+        try:
+            bracket = client.place_oco_order(symbol, "SELL", filled, take_profit_price=take, stop_price=stop, stop_limit_price=stop)
+        except Exception:
+            LOG.exception("protective bracket failed for %s; flattening entry", symbol)
+            try:
+                client.cancel_all_open_orders(symbol)
+                client.market_order(symbol, "SELL", filled, client_order_id=f"orca-flatten-{symbol}-{int(time.time() * 1000)}")
+            except Exception:
+                LOG.exception("failed to flatten unprotected entry for %s", symbol)
+            results.append({"symbol": symbol, "action": "aborted", "reason": "bracket-failed-flattened"})
+            continue
+        risk.opened()
+        positions[symbol] = {
+            "quantity": filled,
+            "entry": price,
+            "opened_at_ms": int(time.time() * 1000),
+            "quote_asset": cfg.quote_asset,
+            "client_order_id": client_order_id,
+            "bracket": bracket,
+        }
+        save_positions(cfg.positions_path, positions)
         open_count += 1
         LOG.info("opened %s qty=%s entry=%.8f stop=%.8f take=%.8f", symbol, qty, price, stop, take)
         results.append({"symbol": symbol, "action": "opened", "order": order, "bracket": bracket})
+    if not ledger_unreadable:
+        save_positions(cfg.positions_path, positions)
     return {"results": results}
 
 
@@ -465,6 +600,7 @@ def run_live(cfg: Config, client: BinanceREST) -> None:
     if cfg.mode is not Mode.LIVE:
         raise RuntimeError("live requires TRADING_MODE=live with LIVE_TRADING_CONFIRM set")
     risk, strategy = RiskGate(cfg), RegimeStrategy(cfg)
+    positions = load_positions(cfg.positions_path)
     risk.restore(load_risk_state(cfg.risk_state_path))
     stop_requested = {"flag": False}
 
@@ -475,12 +611,26 @@ def run_live(cfg: Config, client: BinanceREST) -> None:
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
     LOG.info("live loop started for %s, polling every %ss — started by explicit command, not scheduled", cfg.symbols, cfg.live_poll_seconds)
+    consecutive_failures = 0
     while not stop_requested["flag"]:
         try:
-            run_live_cycle(cfg, client, risk, strategy)
+            run_live_cycle(cfg, client, risk, strategy, positions)
+            consecutive_failures = 0
+        except BinanceError as exc:
+            consecutive_failures += 1
+            LOG.error("live cycle failed: %s", exc)
+            if exc.is_fatal or consecutive_failures >= 5:
+                LOG.error("stopping live loop after unrecoverable/repeated Binance failures")
+                break
         except Exception:
+            consecutive_failures += 1
             LOG.exception("live cycle failed; will retry next poll")
+            if consecutive_failures >= 5:
+                LOG.error("stopping live loop after five consecutive failures")
+                break
         save_risk_state(cfg.risk_state_path, risk)
+        if positions.get("__unreadable__") is not True:
+            save_positions(cfg.positions_path, positions)
         for _ in range(cfg.live_poll_seconds):
             if stop_requested["flag"]:
                 break

@@ -489,6 +489,8 @@ def live_equity(client: BinanceREST, quote_asset: str) -> Optional[float]:
     account = client.account()
     if not isinstance(account, dict):
         return None
+    if account.get("canWithdraw") is True:
+        raise RuntimeError("live trading refuses an API key with withdrawal permission")
     for balance in account.get("balances", []):
         if balance.get("asset") == quote_asset:
             return float(balance.get("free", 0)) + float(balance.get("locked", 0))

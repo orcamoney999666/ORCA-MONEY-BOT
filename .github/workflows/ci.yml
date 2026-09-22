@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: the suite only needs to read the checked-out code.
+permissions:
+  contents: read
+
+# A newer push to the same branch/PR cancels the older, still-running job.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    env:
+      # CI must never be able to reach live trading: paper mode, no keys, no confirmation.
+      TRADING_MODE: paper
+      LIVE_TRADING_CONFIRM: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt: the bot and its tests run on the standard library only."
+          fi
+
+      - name: Byte-compile sources
+        run: python -m compileall -q .
+
+      - name: Run tests
+        run: python -m unittest discover -v
+
+      - name: Smoke-check configuration
+        run: python binance_trading_bot.py config-check

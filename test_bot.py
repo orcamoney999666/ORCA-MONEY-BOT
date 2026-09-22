@@ -65,6 +65,14 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(OracleError):
             MarketOracle(lambda *_: bad, OracleConfig(max_age_seconds=10_000_000)).validate(bad, now_ms=3_600_001_000)
 
+    def test_rejects_invalid_request_shape(self):
+        candles = self._candles(10_000_000)
+        oracle = MarketOracle(lambda *_: candles, OracleConfig(max_age_seconds=10_000))
+        with self.assertRaises(OracleError):
+            oracle.candles("BTC-USDT", now_ms=10_000_000)
+        with self.assertRaises(OracleError):
+            oracle.candles("BTCUSDT", "10m", now_ms=10_000_000)
+
 
 class MonitoringTests(unittest.TestCase):
     def test_emits_readable_jsonl_event(self):

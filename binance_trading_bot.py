@@ -420,8 +420,10 @@ def load_csv(path: str) -> list[Candle]:
 
 
 def backtest(candles: list[Candle], cfg: Config) -> dict[str, float]:
-    if not candles or not cfg.symbols:
+    if len(candles) < 2 or not cfg.symbols:
         return {"trades": 0, "pnl": 0.0, "win_rate_pct": 0.0, "profit_factor": 0.0}
+    from oracle import MarketOracle
+    candles = MarketOracle(lambda *_: []).historical(candles)
     strategy, risk = RegimeStrategy(cfg), RiskGate(cfg)
     broker = PaperBroker(cfg, risk)
     for i in range(len(candles)):
@@ -670,6 +672,8 @@ def main() -> int:
     if not cfg.symbols: raise SystemExit("SYMBOLS is empty")
     if args.command == "live":
         run_live(cfg, client); return 0
-    print(json.dumps([c.__dict__ for c in client.klines(cfg.symbols[0])[-5:]], indent=2)); return 0
+    from oracle import MarketOracle, OracleConfig
+    candles = MarketOracle(client.klines, OracleConfig(cfg.oracle_max_age_seconds, cfg.oracle_interval_seconds)).candles(cfg.symbols[0])
+    print(json.dumps([c.__dict__ for c in candles[-5:]], indent=2)); return 0
 
 if __name__ == "__main__": raise SystemExit(main())

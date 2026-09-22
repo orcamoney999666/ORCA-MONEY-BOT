@@ -34,6 +34,10 @@ non-monotonic, gapped, NaN, negative, or internally inconsistent OHLCV data. The
 and guarded bridge use it before strategy evaluation; an Oracle rejection is always a
 no-trade decision and is recorded in the audit stream.
 
+The previously open Phase 1 Oracle gap is now closed: offline backtests, CLI fetches,
+bridge market-data/signal requests, and the autonomous live path all use the same Oracle
+validation contract. Oracle is still a validator, not a strategy or an execution layer.
+
 ## Phase 4: observability and trial operation
 
 `monitoring.py` provides dependency-free JSONL audit events for health and per-symbol

@@ -25,8 +25,8 @@ def _request_limit(value: object) -> int:
         limit = int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("limit must be an integer") from exc
-    if not 1 <= limit <= MAX_CANDLES:
-        raise ValueError(f"limit must be between 1 and {MAX_CANDLES}")
+    if not 2 <= limit <= MAX_CANDLES:
+        raise ValueError(f"limit must be between 2 and {MAX_CANDLES}")
     return limit
 
 
@@ -67,16 +67,16 @@ def main() -> int:
                 result = {"mode": cfg.mode.value, "symbols": list(cfg.symbols), "live_enabled": cfg.mode.value == "live"}
             elif command == "market_data":
                 interval = str(request.get("interval", "1h"))
-                if interval not in ALLOWED_INTERVALS:
-                    raise ValueError("unsupported interval")
                 client = client or BinanceREST(cfg)
                 symbol = _symbol(request.get("symbol"), cfg)
-                candles = client.klines(symbol, interval, _request_limit(request.get("limit", 50)))
+                oracle = MarketOracle(client.klines, OracleConfig(cfg.oracle_max_age_seconds, cfg.oracle_interval_seconds))
+                candles = oracle.candles(symbol, interval, _request_limit(request.get("limit", 50)))
                 result = {"symbol": symbol, "candles": [c.__dict__ for c in candles]}
             elif command == "signal":
                 client = client or BinanceREST(cfg)
                 symbol = _symbol(request.get("symbol"), cfg)
-                candles = client.klines(symbol)
+                oracle = MarketOracle(client.klines, OracleConfig(cfg.oracle_max_age_seconds, cfg.oracle_interval_seconds))
+                candles = oracle.candles(symbol)
                 result = {"symbol": symbol, "signal": RegimeStrategy(cfg).decide(candles).value, "atr": atr(candles, cfg.atr_period)}
             elif command == "backtest":
                 result = backtest(load_csv(_csv_path(request.get("csv"))), cfg)

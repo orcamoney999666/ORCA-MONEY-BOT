@@ -22,6 +22,8 @@ class OracleConfig:
     max_age_seconds: int = 300
     expected_interval_seconds: int = 3600
     max_gap_intervals: int = 2
+    allowed_intervals: frozenset[str] = frozenset({"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"})
+    max_candles: int = 1000
 
 
 class MarketOracle:
@@ -57,4 +59,16 @@ class MarketOracle:
         return list(candles)
 
     def candles(self, symbol: str, interval: str = "1h", limit: int = 300, now_ms: int | None = None) -> list[Candle]:
+        if not symbol or not symbol.isalnum():
+            raise OracleError("oracle rejected invalid symbol")
+        if interval not in self.config.allowed_intervals:
+            raise OracleError("oracle rejected unsupported interval")
+        if not 2 <= limit <= self.config.max_candles:
+            raise OracleError("oracle rejected invalid candle limit")
         return self.validate(self.fetcher(symbol, interval, limit), now_ms=now_ms)
+
+    def historical(self, candles: Sequence[Candle]) -> list[Candle]:
+        """Validate an offline series without applying a wall-clock freshness check."""
+        if not candles:
+            raise OracleError("oracle received no historical candles")
+        return self.validate(candles, now_ms=candles[-1].timestamp)

@@ -11,6 +11,8 @@ from binance_trading_bot import (
     BinanceError, BinanceREST, Candle, Config, Mode, RegimeStrategy, RiskGate, Signal, atr, backtest,
     load_risk_state, round_to_step, run_live, run_live_cycle, save_risk_state,
 )
+from oracle import MarketOracle, OracleConfig, OracleError
+from monitoring import JsonlMonitor
 
 class BotTests(unittest.TestCase):
     def test_atr_is_positive(self):
@@ -41,6 +43,37 @@ class BotTests(unittest.TestCase):
         gate.closed(-1)
         ok, _, reason = gate.approve(Signal.BUY, 100, 2, 0)
         self.assertFalse(ok); self.assertEqual(reason, "hourly-trade-limit")
+
+
+class OracleTests(unittest.TestCase):
+    def _candles(self, now_ms=None):
+        now_ms = now_ms or int(__import__("time").time() * 1000)
+        return [Candle(now_ms - 3600000, 100, 102, 99, 101, 10), Candle(now_ms, 101, 103, 100, 102, 12)]
+
+    def test_accepts_fresh_consistent_candles(self):
+        candles = self._candles(10_000_000)
+        result = MarketOracle(lambda *_: candles, OracleConfig(max_age_seconds=10_000)).candles("BTCUSDT", now_ms=10_000_000)
+        self.assertEqual(len(result), 2)
+
+    def test_rejects_stale_candles(self):
+        candles = self._candles(10_000_000)
+        with self.assertRaises(OracleError):
+            MarketOracle(lambda *_: candles, OracleConfig(max_age_seconds=1)).candles("BTCUSDT", now_ms=20_000_000)
+
+    def test_rejects_bad_ohlc_and_gaps(self):
+        bad = [Candle(1_000, 100, 99, 98, 100), Candle(3_600_001_000, 100, 102, 99, 101)]
+        with self.assertRaises(OracleError):
+            MarketOracle(lambda *_: bad, OracleConfig(max_age_seconds=10_000_000)).validate(bad, now_ms=3_600_001_000)
+
+
+class MonitoringTests(unittest.TestCase):
+    def test_emits_readable_jsonl_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            record = JsonlMonitor(path, dry_run=True).emit("decision", action="no-trade", reason="oracle-rejected")
+            self.assertTrue(path.exists())
+            self.assertTrue(json.loads(path.read_text())["dry_run"])
+            self.assertEqual(record["event"], "decision")
 
 def _mock_response(payload: bytes):
     resp = MagicMock()

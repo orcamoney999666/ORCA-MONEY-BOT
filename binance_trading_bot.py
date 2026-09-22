@@ -72,7 +72,10 @@ class Config:
     db_path: Path = field(default_factory=lambda: Path(os.getenv("TRADES_DB_PATH", "data/trades.jsonl")))
     risk_state_path: Path = field(default_factory=lambda: Path(os.getenv("RISK_STATE_PATH", "data/risk_state.json")))
     positions_path: Path = field(default_factory=lambda: Path(os.getenv("POSITIONS_PATH", "data/positions.json")))
+    event_log_path: Path = field(default_factory=lambda: Path(os.getenv("EVENT_LOG_PATH", "data/events.jsonl")))
     live_poll_seconds: int = field(default_factory=lambda: int(os.getenv("LIVE_POLL_SECONDS", "60")))
+    oracle_max_age_seconds: int = field(default_factory=lambda: int(os.getenv("ORACLE_MAX_AGE_SECONDS", "300")))
+    oracle_interval_seconds: int = field(default_factory=lambda: int(os.getenv("ORACLE_INTERVAL_SECONDS", "3600")))
 
     def validate(self) -> None:
         if not self.symbols or any(not symbol.isalnum() for symbol in self.symbols):
@@ -497,7 +500,7 @@ def live_equity(client: BinanceREST, quote_asset: str) -> Optional[float]:
     return 0.0
 
 
-def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: RegimeStrategy, positions: Optional[dict] = None) -> dict:
+def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: RegimeStrategy, positions: Optional[dict] = None, oracle=None, monitor=None) -> dict:
     """One real evaluate-and-act pass over every symbol.
 
     Binance spot has no shorting: a SELL signal only ever closes a position you
@@ -530,7 +533,12 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
         if open_symbols[symbol]:
             results.append({"symbol": symbol, "action": "skipped", "reason": "open-order-exists"})
             continue
-        candles = client.klines(symbol)
+        try:
+            candles = oracle.candles(symbol) if oracle is not None else client.klines(symbol)
+        except Exception as exc:
+            LOG.warning("oracle rejected %s: %s", symbol, exc)
+            results.append({"symbol": symbol, "action": "no-trade", "reason": "oracle-rejected"})
+            continue
         if not candles:
             results.append({"symbol": symbol, "action": "skipped", "reason": "no-data"})
             continue
@@ -592,6 +600,9 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
         results.append({"symbol": symbol, "action": "opened", "order": order, "bracket": bracket})
     if not ledger_unreadable:
         save_positions(cfg.positions_path, positions)
+    if monitor is not None:
+        for item in results:
+            monitor.emit("decision", **item)
     return {"results": results}
 
 
@@ -603,6 +614,11 @@ def run_live(cfg: Config, client: BinanceREST) -> None:
         raise RuntimeError("live requires TRADING_MODE=live with LIVE_TRADING_CONFIRM set")
     risk, strategy = RiskGate(cfg), RegimeStrategy(cfg)
     positions = load_positions(cfg.positions_path)
+    from oracle import MarketOracle, OracleConfig
+    from monitoring import JsonlMonitor
+    oracle = MarketOracle(client.klines, OracleConfig(cfg.oracle_max_age_seconds, cfg.oracle_interval_seconds))
+    monitor = JsonlMonitor(cfg.event_log_path)
+    monitor.health(cfg.mode.value, cfg.symbols, oracle_ok=True)
     risk.restore(load_risk_state(cfg.risk_state_path))
     stop_requested = {"flag": False}
 
@@ -616,7 +632,7 @@ def run_live(cfg: Config, client: BinanceREST) -> None:
     consecutive_failures = 0
     while not stop_requested["flag"]:
         try:
-            run_live_cycle(cfg, client, risk, strategy, positions)
+            run_live_cycle(cfg, client, risk, strategy, positions, oracle, monitor)
             consecutive_failures = 0
         except BinanceError as exc:
             consecutive_failures += 1

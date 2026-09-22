@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 
 from binance_trading_bot import Config, BinanceREST, RegimeStrategy, atr, backtest, load_csv, load_positions
+from oracle import MarketOracle, OracleConfig
+from monitoring import JsonlMonitor
 
 MAX_LINE_BYTES = 256 * 1024
 MAX_CANDLES = 1000
@@ -86,7 +88,8 @@ def main() -> int:
                 from binance_trading_bot import RiskGate, run_live_cycle
                 cfg.validate()
                 client = client or BinanceREST(cfg)
-                result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg), load_positions(cfg.positions_path))
+                oracle = MarketOracle(client.klines, OracleConfig(cfg.oracle_max_age_seconds, cfg.oracle_interval_seconds))
+                result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg), load_positions(cfg.positions_path), oracle, JsonlMonitor(cfg.event_log_path))
             else:
                 raise ValueError(f"unknown command: {command}")
             print(json.dumps({"ok": True, "result": result}, default=str), flush=True)

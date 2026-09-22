@@ -12,7 +12,7 @@
 - إضافة Paper Broker واختبار تاريخي CSV ومقاييس أولية.
 - جعل الاتصال بـ Binance اختياريًا؛ لا حاجة إلى Redis/PostgreSQL لتشغيل الاختبارات.
 
-## Phase 2 safety hardening (in progress)
+## Phase 2 safety hardening
 
 The live path now reads the real quote-asset balance before sizing, caps order notional
 with `MAX_NOTIONAL_PCT`, records entries for the hourly limit, persists a position ledger,
@@ -26,6 +26,22 @@ This does **not** complete Oracle or authorize live trading. The position reconc
 still depends on observable Binance trade history and must be validated on Testnet before
 any real account is considered. The live loop stops after a fatal Binance error or five
 consecutive failures rather than retrying indefinitely.
+
+## Phase 3: market-data Oracle
+
+`oracle.py` is a decision-independent validation layer. It rejects empty, stale, future,
+non-monotonic, gapped, NaN, negative, or internally inconsistent OHLCV data. The live loop
+and guarded bridge use it before strategy evaluation; an Oracle rejection is always a
+no-trade decision and is recorded in the audit stream.
+
+## Phase 4: observability and trial operation
+
+`monitoring.py` provides dependency-free JSONL audit events for health and per-symbol
+decisions. The event path is `EVENT_LOG_PATH` and defaults to `data/events.jsonl`, which is
+ignored by Git. Monitoring records decisions and safety stops without changing strategy
+behavior or enabling live trading. External notification providers and WebSocket transport
+remain adapters to add only after their contracts are defined and tested; the current
+polling path is deliberately retained as the safe baseline.
 
 ## Real order execution (added this session)
 

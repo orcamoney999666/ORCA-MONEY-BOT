@@ -6,18 +6,23 @@ operator opt-ins and still passes through the bot's normal Config validation, th
 API-key check as the `live` command, and the same persisted risk state and position
 ledger. A bridge that built a fresh RiskGate per request would reset the daily-loss,
 drawdown and hourly limits on every call.
+
+The bridge talks to other local processes, so its inputs are bounded: one request line is
+read at most MAX_LINE_BYTES at a time, and `backtest` only reads CSVs inside csv_root().
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
+import time
 from pathlib import Path
+from typing import Optional
 
 from binance_trading_bot import (
     ALLOWED_INTERVALS, BinanceREST, Config, Mode, PositionLedger, RegimeStrategy, RiskGate,
-    assert_key_is_trade_only, atr, backtest, load_csv, load_risk_state, run_live_cycle,
-    save_risk_state,
+    append_event, assert_key_is_trade_only, atr, backtest, load_csv, load_risk_state,
+    run_live_cycle, save_risk_state, validate_candles,
 )
 
 MAX_LINE_BYTES = 256 * 1024
@@ -41,14 +46,25 @@ def _symbol(value: object, cfg: Config) -> str:
     return symbol
 
 
+def csv_root() -> Path:
+    """The one directory `backtest` may read CSVs from: `data/` unless ORCA_BRIDGE_CSV_DIR
+    names another. Without it, any local process could read any .csv on the machine."""
+    return Path(os.getenv("ORCA_BRIDGE_CSV_DIR", "data")).expanduser().resolve()
+
+
 def _csv_path(value: object) -> str:
     if not value:
         raise ValueError("csv is required")
-    path = Path(str(value)).expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError("CSV file not found: %s" % path)
+    root = csv_root()
+    path = Path(str(value)).expanduser()
+    # Relative paths are taken from the root; resolve() collapses any `..` before the check.
+    path = (path if path.is_absolute() else root / path).resolve()
+    if root not in path.parents:
+        raise PermissionError("csv must be inside %s (set ORCA_BRIDGE_CSV_DIR to change it)" % root)
     if path.suffix.lower() != ".csv":
         raise ValueError("csv must point to a .csv file")
+    if not path.is_file():
+        raise FileNotFoundError("CSV file not found: %s" % path)
     return str(path)
 
 
@@ -70,9 +86,14 @@ class LiveSession:
 
     def cycle(self, client: BinanceREST) -> dict:
         try:
-            return run_live_cycle(self.cfg, client, self.risk, self.strategy, self.ledger)
+            outcome = run_live_cycle(self.cfg, client, self.risk, self.strategy, self.ledger)
+        except Exception as exc:
+            append_event(self.cfg.event_log_path, "cycle-failed", source="bridge", error=str(exc))
+            raise
         finally:
             save_risk_state(self.cfg.risk_state_path, self.risk)
+        append_event(self.cfg.event_log_path, "cycle", source="bridge", **outcome)
+        return outcome
 
 
 def handle(request: dict, cfg: Config, state: dict) -> dict:
@@ -104,6 +125,10 @@ def handle(request: dict, cfg: Config, state: dict) -> dict:
         closed = candles[:-1] if len(candles) > 1 else []
         if not closed:
             raise ValueError("not enough closed candles for a signal")
+        # The same data checks the live cycle applies, so a signal is never read off a
+        # stale or broken feed.
+        validate_candles(closed, cfg.kline_interval, now_ms=int(time.time() * 1000),
+                         max_delay_seconds=cfg.candle_max_delay_seconds)
         return {"symbol": symbol, "signal": RegimeStrategy(cfg).decide(closed).value,
                 "atr": atr(closed, cfg.atr_period)}
     if command == "live_cycle":
@@ -120,24 +145,48 @@ def handle(request: dict, cfg: Config, state: dict) -> dict:
     raise ValueError("unknown command: %s" % command)
 
 
-def main() -> int:
+def _read_line(stream) -> Optional[str]:
+    """One request line, read in bounded chunks so an unterminated flood cannot exhaust
+    memory. Returns the line, "" for an over-long line (the rest of it is discarded), or
+    None at end of input."""
+    line = stream.readline(MAX_LINE_BYTES + 1)
+    if not line:
+        return None
+    if len(line) > MAX_LINE_BYTES or len(line.encode("utf-8")) > MAX_LINE_BYTES:
+        while line and not line.endswith("\n"):
+            line = stream.readline(MAX_LINE_BYTES + 1)
+        return ""
+    return line
+
+
+def main(stdin=None, stdout=None) -> int:
+    stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+
+    def reply(payload: dict) -> None:
+        print(json.dumps(payload, default=str), file=stdout, flush=True)
+
     try:
         cfg = Config()
     except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}), flush=True)
+        reply({"ok": False, "error": str(exc)})
         return 2
     state: dict = {"client": None, "live": None}
-    for raw_line in sys.stdin:
-        if len(raw_line.encode("utf-8")) > MAX_LINE_BYTES:
-            print(json.dumps({"ok": False, "error": "request is too large"}), flush=True)
+    while True:
+        raw_line = _read_line(stdin)
+        if raw_line is None:
+            break
+        if raw_line == "":
+            reply({"ok": False, "error": "request is too large"})
+            continue
+        if not raw_line.strip():
             continue
         try:
             request = json.loads(raw_line)
             if not isinstance(request, dict):
                 raise ValueError("request must be a JSON object")
-            print(json.dumps({"ok": True, "result": handle(request, cfg, state)}, default=str), flush=True)
+            reply({"ok": True, "result": handle(request, cfg, state)})
         except Exception as exc:  # noqa: BLE001 - one bad request must not end the stream
-            print(json.dumps({"ok": False, "error": str(exc)}), flush=True)
+            reply({"ok": False, "error": str(exc)})
     return 0
 
 

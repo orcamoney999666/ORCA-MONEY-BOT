@@ -12,17 +12,17 @@ read at most MAX_LINE_BYTES at a time, and `backtest` only reads CSVs inside csv
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
 from binance_trading_bot import (
     ALLOWED_INTERVALS, BinanceREST, Config, Mode, PositionLedger, RegimeStrategy, RiskGate,
-    append_event, assert_key_is_trade_only, atr, backtest, load_csv, load_risk_state,
-    run_live_cycle, save_risk_state, validate_candles,
+    append_event, assert_key_is_trade_only, atr, backtest, closed_candles, exchange_now_ms,
+    load_csv, load_risk_state, run_live_cycle, save_risk_state,
 )
 
 MAX_LINE_BYTES = 256 * 1024
@@ -49,7 +49,8 @@ def _symbol(value: object, cfg: Config) -> str:
 def csv_root() -> Path:
     """The one directory `backtest` may read CSVs from: `data/` unless ORCA_BRIDGE_CSV_DIR
     names another. Without it, any local process could read any .csv on the machine."""
-    return Path(os.getenv("ORCA_BRIDGE_CSV_DIR", "data")).expanduser().resolve()
+    # An empty value falls back too: Path("") would silently mean the working directory.
+    return Path(os.getenv("ORCA_BRIDGE_CSV_DIR") or "data").expanduser().resolve()
 
 
 def _csv_path(value: object) -> str:
@@ -121,14 +122,11 @@ def handle(request: dict, cfg: Config, state: dict) -> dict:
     if command == "signal":
         symbol = _symbol(request.get("symbol"), cfg)
         candles = client.klines(symbol, cfg.kline_interval)
-        # Decide on closed bars only, exactly as the live cycle does.
-        closed = candles[:-1] if len(candles) > 1 else []
+        # Closed bars only, checked against the exchange clock: the same path the live
+        # cycle takes, so a signal is never read off a stale or broken feed.
+        closed = closed_candles(candles, cfg, exchange_now_ms(client))
         if not closed:
             raise ValueError("not enough closed candles for a signal")
-        # The same data checks the live cycle applies, so a signal is never read off a
-        # stale or broken feed.
-        validate_candles(closed, cfg.kline_interval, now_ms=int(time.time() * 1000),
-                         max_delay_seconds=cfg.candle_max_delay_seconds)
         return {"symbol": symbol, "signal": RegimeStrategy(cfg).decide(closed).value,
                 "atr": atr(closed, cfg.atr_period)}
     if command == "live_cycle":
@@ -159,8 +157,17 @@ def _read_line(stream) -> Optional[str]:
     return line
 
 
+def _default_stdin():
+    """stdin decoded leniently: an invalid UTF-8 byte becomes U+FFFD and fails that one
+    request, instead of raising UnicodeDecodeError and ending the whole stream."""
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:
+        return sys.stdin
+    return io.TextIOWrapper(buffer, encoding="utf-8", errors="replace")
+
+
 def main(stdin=None, stdout=None) -> int:
-    stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+    stdin, stdout = stdin or _default_stdin(), stdout or sys.stdout
 
     def reply(payload: dict) -> None:
         print(json.dumps(payload, default=str), file=stdout, flush=True)

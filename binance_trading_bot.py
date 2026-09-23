@@ -568,8 +568,21 @@ def atr(candles: list[Candle], period: int = 14) -> Optional[float]:
 
 # ---- market-data validation ----------------------------------------------
 
+# How far a bar's close may sit in the future and still count as closed: clock error
+# only. Kept well under a minute, so even on 1m bars a forming bar cannot pass as closed.
+CLOCK_TOLERANCE_MS = 5000
+
+
 class MarketDataError(ValueError):
     """Candles that must not be decided on: broken, out of order, gapped, or stale."""
+
+
+def exchange_now_ms(client: object) -> int:
+    """Now, on Binance's clock. Kline timestamps are exchange time, so a host clock that
+    drifts would otherwise read fresh bars as unclosed or stale ones as fresh. Uses the
+    offset sync_time() measured; a client that has not synced it counts as zero."""
+    offset = getattr(client, "_time_offset_ms", 0)
+    return int(time.time() * 1000) + (offset if isinstance(offset, int) else 0)
 
 
 def validate_candles(candles: list[Candle], interval: Optional[str] = None, now_ms: Optional[int] = None,
@@ -584,9 +597,11 @@ def validate_candles(candles: list[Candle], interval: Optional[str] = None, now_
     older gap, from exchange maintenance say, is left alone: rejecting it would stop
     trading for as long as it stays in the window.
 
-    With an interval and now_ms: the newest bar must be a closed bar that closed within one
-    interval plus max_delay_seconds of now. A feed that stopped updating returns the same
-    old bars indefinitely, and a signal read from them is a signal about the past.
+    With an interval and now_ms: the newest bar must already have closed (allowing only
+    CLOCK_TOLERANCE_MS for clock error, so a still-forming bar never passes), and must have
+    closed within one interval plus max_delay_seconds of now. A feed that stopped updating
+    returns the same old bars indefinitely, and a signal read from them is a signal about
+    the past. now_ms should be exchange time; see exchange_now_ms.
     """
     for candle in candles:
         prices = (candle.open, candle.high, candle.low, candle.close)
@@ -615,13 +630,27 @@ def validate_candles(candles: list[Candle], interval: Optional[str] = None, now_
     if now_ms is not None:
         closed_at = candles[-1].timestamp + step_ms
         slack_ms = max_delay_seconds * 1000
-        if closed_at > now_ms + slack_ms:
+        if closed_at > now_ms + CLOCK_TOLERANCE_MS:
             raise MarketDataError("the newest candle has not closed yet (closes at %s, now %s)"
                                   % (closed_at, now_ms))
         if now_ms - closed_at > step_ms + slack_ms:
             raise MarketDataError("market data is stale: the newest closed candle ended %ds ago"
                                   % ((now_ms - closed_at) // 1000))
     return candles
+
+
+def closed_candles(candles: list[Candle], cfg: Config, now_ms: int) -> list[Candle]:
+    """The closed bars of a Binance kline response, validated; [] when there are none.
+
+    The final kline is the bar still forming. Its close repaints until the interval ends,
+    so a signal read from it can appear, trade, and then vanish. Raises MarketDataError
+    when the closed bars are unfit to decide on.
+    """
+    closed = candles[:-1] if len(candles) > 1 else []
+    if closed:
+        validate_candles(closed, cfg.kline_interval, now_ms=now_ms,
+                         max_delay_seconds=cfg.candle_max_delay_seconds)
+    return closed
 
 
 class RegimeStrategy:
@@ -858,17 +887,25 @@ def save_risk_state(path: Path, risk: RiskGate) -> None:
     _atomic_write_text(path, json.dumps(risk.state_dict()))
 
 
-def append_event(path: Path, event: str, **fields) -> None:
+EVENT_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def append_event(path: Path, event: str, max_bytes: int = EVENT_LOG_MAX_BYTES, **fields) -> None:
     """Append one audit record to the JSONL event log.
 
     The log is how a run is reviewed afterwards: what each cycle decided and why, and why
     the loop stopped. It is append-only, and a failed write is logged rather than raised,
     because an audit record is never a reason to leave a position unmanaged.
+
+    Past max_bytes the file is rotated to `<name>.1` (replacing the previous one), so a bot
+    left running cannot fill the disk the risk state and position ledger live on.
     """
     record = {"time": datetime.now(timezone.utc).isoformat(), "event": event}
     record.update(fields)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size >= max_bytes:
+            os.replace(str(path), str(path.with_name(path.name + ".1")))
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, default=str, sort_keys=True) + "\n")
     except OSError:
@@ -1272,6 +1309,7 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
     """
     ledger = ledger if ledger is not None else PositionLedger()
     results: list[dict] = []
+    data_checks = data_failures = 0
     results.extend(recover_unconfirmed_entries(cfg, client, risk, ledger))
     results.extend(reconcile_positions(cfg, client, risk, ledger))
     results.extend(protect_open_positions(cfg, client, risk, ledger))
@@ -1287,35 +1325,40 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
         if client.weight_is_critical():
             results.append({"symbol": symbol, "action": "skipped", "reason": "rate-limit-budget"})
             continue
+        data_checks += 1
         try:
             candles = client.klines(symbol, cfg.kline_interval)
-        except Exception as exc:  # noqa: BLE001 - one symbol's feed must not stop the others
+        except Exception as exc:  # noqa: BLE001 - one symbol's bad feed must not stop the others
             _reraise_if_fatal(exc)
+            if isinstance(exc, BinanceError) and exc.is_retryable:
+                # Rate limiting or an outage at Binance hits every symbol alike. Carrying on
+                # to the next one only adds requests, and repeated 429s earn a 418 IP ban.
+                raise
             LOG.exception("no candles for %s; skipping it this cycle", symbol)
-            results.append({"symbol": symbol, "action": "skipped", "reason": "no-data"})
-            continue
-        # The final kline is the bar still forming. Its close repaints until the interval
-        # ends, so a signal read from it can appear, trade, and then vanish.
-        closed_candles = candles[:-1] if len(candles) > 1 else []
-        if not closed_candles:
+            data_failures += 1
             results.append({"symbol": symbol, "action": "skipped", "reason": "no-data"})
             continue
         try:
-            validate_candles(closed_candles, cfg.kline_interval, now_ms=int(time.time() * 1000),
-                             max_delay_seconds=cfg.candle_max_delay_seconds)
+            usable = closed_candles(candles, cfg, exchange_now_ms(client))
         except MarketDataError as exc:
             LOG.warning("refusing to decide on %s: %s", symbol, exc)
+            data_failures += 1
             results.append({"symbol": symbol, "action": "no-trade", "reason": "bad-market-data",
                             "detail": str(exc)})
             continue
-        decision = strategy.decide(closed_candles)
+        if not usable:
+            data_failures += 1
+            results.append({"symbol": symbol, "action": "skipped", "reason": "no-data"})
+            continue
+        decision = strategy.decide(usable)
         if decision is Signal.SELL:
             results.append({"symbol": symbol, "action": "skipped", "reason": "spot-no-short"})
             continue
-        a = atr(closed_candles, cfg.atr_period)
+        a = atr(usable, cfg.atr_period)
         try:
             price = client.ticker_price(symbol)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _reraise_if_fatal(exc)
             LOG.exception("no live price for %s; skipping it this cycle", symbol)
             results.append({"symbol": symbol, "action": "skipped", "reason": "no-price"})
             continue
@@ -1325,7 +1368,8 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
             continue
         try:
             filters = client.get_symbol_filters(symbol)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _reraise_if_fatal(exc)
             LOG.exception("no filters for %s; skipping it this cycle", symbol)
             results.append({"symbol": symbol, "action": "skipped", "reason": "no-filters"})
             continue
@@ -1373,7 +1417,8 @@ def run_live_cycle(cfg: Config, client: BinanceREST, risk: RiskGate, strategy: R
         ledger.record(position)
         risk.opened()
         results.append(ensure_bracket(cfg, client, risk, ledger, position, filters))
-    return {"results": results, "equity": risk.equity, "open_positions": len(ledger)}
+    return {"results": results, "equity": risk.equity, "open_positions": len(ledger),
+            "market_data_checks": data_checks, "market_data_failures": data_failures}
 
 
 def run_live(cfg: Config, client: BinanceREST) -> None:
@@ -1404,9 +1449,15 @@ def run_live(cfg: Config, client: BinanceREST) -> None:
     while not stop_requested["flag"]:
         try:
             outcome = run_live_cycle(cfg, client, risk, strategy, ledger)
-            failures = 0
-            append_event(cfg.event_log_path, "cycle",
-                         **(outcome if isinstance(outcome, dict) else {"outcome": outcome}))
+            append_event(cfg.event_log_path, "cycle", **outcome)
+            checks = outcome.get("market_data_checks", 0)
+            if checks and outcome.get("market_data_failures", 0) >= checks:
+                # Nothing to decide on for any symbol: a feed outage or a stale feed. It
+                # counts toward MAX_CONSECUTIVE_FAILURES, or the loop would run blind forever.
+                failures += 1
+                LOG.error("no symbol had usable market data this cycle (%d in a row)", failures)
+            else:
+                failures = 0
         except BinanceError as exc:
             failures += 1
             LOG.error("live cycle failed: %s", exc)

@@ -13,7 +13,7 @@ os.environ.setdefault("TRADING_MODE", "paper")
 from binance_trading_bot import (
     BinanceError, BinanceREST, Candle, Config, ConfigError, LivePosition, MarketDataError, Mode,
     PositionLedger, RegimeStrategy, RiskGate, Signal, _atomic_write_text, _net_filled_quantity,
-    _stop_limit_price, append_event, assert_key_is_trade_only, atr, backtest, live_equity,
+    _stop_limit_price, append_event, assert_key_is_trade_only, atr, backtest, exchange_now_ms, live_equity,
     load_risk_state, realized_pnl, reconcile_positions, round_to_step, run_live, run_live_cycle,
     save_risk_state, validate_candles,
 )
@@ -1087,6 +1087,42 @@ class LiveCycleTests(unittest.TestCase):
         with self.assertRaises(BinanceError):
             self._run(cfg, client)
 
+    def test_rate_limiting_stops_the_cycle_instead_of_asking_for_every_symbol(self):
+        """A 429 hits every symbol alike; asking for the next one only earns a 418 ban."""
+        cfg = _live_config(symbols=("BTCUSDT", "ETHUSDT"))
+        client = self._client(_trending_candles(rising=True))
+        client.klines.side_effect = BinanceError(429, -1003, "Too many requests", "/klines")
+        with self.assertRaises(BinanceError):
+            self._run(cfg, client)
+        self.assertEqual(client.klines.call_count, 1)
+
+    def test_a_fatal_error_while_reading_the_price_stops_the_cycle(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.ticker_price.side_effect = BinanceError(401, -2015, "Invalid API-key", "/ticker/price")
+        with self.assertRaises(BinanceError):
+            self._run(cfg, client)
+        client.market_order.assert_not_called()
+
+    def test_the_cycle_reports_how_many_feeds_it_could_use(self):
+        cfg = _live_config(symbols=("BADUSDT", "BTCUSDT"))
+        client = self._client(_trending_candles(rising=True))
+        good = client.klines.return_value
+        client.klines.side_effect = lambda symbol, *_a, **_k: [] if symbol == "BADUSDT" else good
+        result, _ = self._run(cfg, client)
+        self.assertEqual((result["market_data_checks"], result["market_data_failures"]), (2, 1))
+
+    def test_freshness_is_judged_on_the_exchange_clock(self):
+        """Bars a day old on this host's clock are current if the exchange clock (the
+        offset sync_time measured) says so."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        day_old = [Candle(c.timestamp - 24 * HOUR_MS, c.open, c.high, c.low, c.close)
+                   for c in _trending_candles(rising=True)]
+        client = self._client(day_old)
+        client._time_offset_ms = -24 * HOUR_MS
+        result, _ = self._run(cfg, client)
+        self.assertEqual(result["results"][0]["action"], "opened")
+
 
 class LiveLoopTests(unittest.TestCase):
     def _client(self):
@@ -1156,7 +1192,7 @@ class LiveLoopTests(unittest.TestCase):
                                risk_state_path=Path(tmp) / "r.json", positions_path=Path(tmp) / "p.json",
                                event_log_path=Path(tmp) / "e.jsonl")
             with patch("binance_trading_bot.run_live_cycle") as mock_cycle:
-                mock_cycle.side_effect = lambda *a, **k: os.kill(os.getpid(), signal.SIGINT)
+                mock_cycle.side_effect = lambda *a, **k: os.kill(os.getpid(), signal.SIGINT) or {"results": []}
                 run_live(cfg, client)
             client.sync_time.assert_called_once()
 
@@ -1182,6 +1218,49 @@ class LiveLoopTests(unittest.TestCase):
         self.assertEqual(events[0]["api_key"], cfg.masked_key)
 
 
+    def test_a_feed_outage_counts_toward_the_failure_limit(self):
+        """A cycle where no symbol had usable data did nothing; the loop must not run
+        blind forever just because no exception was raised."""
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "e.jsonl"
+            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5, max_consecutive_failures=3,
+                               risk_state_path=Path(tmp) / "r.json", positions_path=Path(tmp) / "p.json",
+                               event_log_path=log)
+            blind = {"results": [], "market_data_checks": 1, "market_data_failures": 1}
+            with patch("binance_trading_bot.run_live_cycle", return_value=blind) as mock_cycle:
+                with patch("binance_trading_bot.time.sleep"):
+                    run_live(cfg, client)
+            events = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(mock_cycle.call_count, 3)
+        self.assertEqual(events[-1]["reason"], "too-many-failures")
+
+    def test_one_usable_feed_resets_the_failure_count(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5, max_consecutive_failures=2,
+                               risk_state_path=Path(tmp) / "r.json", positions_path=Path(tmp) / "p.json",
+                               event_log_path=Path(tmp) / "e.jsonl")
+            blind = {"results": [], "market_data_checks": 2, "market_data_failures": 2}
+            partial = {"results": [], "market_data_checks": 2, "market_data_failures": 1}
+            with patch("binance_trading_bot.run_live_cycle",
+                       side_effect=[blind, partial, blind, blind]) as mock_cycle:
+                with patch("binance_trading_bot.time.sleep"):
+                    run_live(cfg, client)
+        self.assertEqual(mock_cycle.call_count, 4)
+
+
+class ExchangeClockTests(unittest.TestCase):
+    def test_the_measured_offset_is_applied(self):
+        client = MagicMock(spec=BinanceREST)
+        client._time_offset_ms = 60_000
+        self.assertAlmostEqual(exchange_now_ms(client), int(time.time() * 1000) + 60_000, delta=1000)
+
+    def test_a_client_that_never_synced_uses_the_host_clock(self):
+        self.assertAlmostEqual(exchange_now_ms(MagicMock(spec=BinanceREST)), int(time.time() * 1000),
+                               delta=1000)
+
+
 class EventLogTests(unittest.TestCase):
     def test_events_are_appended_one_json_object_per_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1197,6 +1276,16 @@ class EventLogTests(unittest.TestCase):
             blocker = Path(tmp) / "file"
             blocker.write_text("")
             append_event(blocker / "e.jsonl", "cycle")   # parent is a file: the write fails
+
+    def test_a_full_log_is_rotated_so_it_cannot_fill_the_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "e.jsonl"
+            for n in range(5):
+                append_event(log, "cycle", max_bytes=100, n=n)
+            rotated = log.with_name("e.jsonl.1")
+            self.assertTrue(rotated.exists())
+            self.assertLess(log.stat().st_size, 200)
+            self.assertEqual(json.loads(log.read_text().splitlines()[-1])["n"], 4)
 
 
 def _series(n=5, start=0, step=HOUR_MS):
@@ -1262,6 +1351,12 @@ class MarketDataValidationTests(unittest.TestCase):
         candles = _series()
         with self.assertRaises(MarketDataError):
             validate_candles(candles, "1h", now_ms=candles[-1].timestamp + 1000)
+
+    def test_a_forming_one_minute_bar_is_not_taken_as_closed(self):
+        """Only clock error is tolerated, so even a 1m bar halfway through is refused."""
+        candles = _series(step=60 * 1000)
+        with self.assertRaises(MarketDataError):
+            validate_candles(candles, "1m", now_ms=candles[-1].timestamp + 30 * 1000)
 
     def test_an_unknown_interval_is_refused(self):
         with self.assertRaises(MarketDataError):

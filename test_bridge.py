@@ -67,6 +67,14 @@ class BridgeReadOnlyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             handle({"command": "signal", "symbol": "BTCUSDT"}, Config(), {"client": client, "live": None})
 
+    def test_signal_reads_freshness_off_the_exchange_clock(self):
+        client = MagicMock(spec=BinanceREST)
+        client.klines.return_value = [Candle(c.timestamp - 48 * 3600 * 1000, c.open, c.high, c.low, c.close)
+                                      for c in _candles()]
+        client._time_offset_ms = -48 * 3600 * 1000
+        result = handle({"command": "signal", "symbol": "BTCUSDT"}, Config(), {"client": client, "live": None})
+        self.assertEqual(result["signal"], "BUY")
+
 
 class BridgeLiveGateTests(unittest.TestCase):
     """The bridge is a second door onto live trading, so it carries the same locks."""
@@ -197,6 +205,16 @@ class BridgeStreamTests(unittest.TestCase):
         self.assertEqual(orca_bridge._read_line(io.StringIO(line)), "")
 
 
+    def test_invalid_utf8_fails_one_request_not_the_stream(self):
+        raw = io.TextIOWrapper(io.BytesIO(b'{"command":"\xff"}\n{"command":"health"}\n'), encoding="utf-8")
+        out = io.StringIO()
+        with patch.object(orca_bridge.sys, "stdin", raw), \
+                patch.object(orca_bridge, "Config", MagicMock(return_value=Config())):
+            self.assertEqual(orca_bridge.main(stdout=out), 0)
+        responses = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([r["ok"] for r in responses], [False, True])
+
+
 class BridgeCsvTests(unittest.TestCase):
     def _root(self, root):
         return patch.dict(os.environ, {"ORCA_BRIDGE_CSV_DIR": root})
@@ -218,6 +236,11 @@ class BridgeCsvTests(unittest.TestCase):
     def test_climbing_out_of_the_folder_is_refused(self):
         with tempfile.TemporaryDirectory() as root, self._root(root), self.assertRaises(PermissionError):
             orca_bridge._csv_path("../escape.csv")
+
+    def test_an_empty_folder_setting_falls_back_to_data(self):
+        """Path("") is the working directory, which would open the whole checkout."""
+        with self._root(""):
+            self.assertEqual(orca_bridge.csv_root(), Path("data").resolve())
 
     def test_a_file_that_is_not_a_csv_is_refused(self):
         with tempfile.TemporaryDirectory() as root, self._root(root), self.assertRaises(ValueError):

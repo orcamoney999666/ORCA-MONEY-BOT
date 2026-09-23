@@ -96,10 +96,19 @@ with reason `bad-market-data` — when:
 - the newest closed bar ended more than one interval plus `CANDLE_MAX_DELAY_SECONDS` ago.
   A feed that stopped updating keeps returning the same old bars, and a signal read from
   them is a signal about the past.
+- the newest bar has not closed yet. Only 5 seconds of clock error are allowed, so even a
+  1-minute bar still forming is never read as closed.
 
-A symbol whose candles cannot be fetched at all is skipped for that cycle without stopping
-the others; a fatal error (bad key, banned IP) still stops the loop. `backtest` applies the
-per-bar and ordering checks to CSV input too, and exits with an error on a broken file.
+Both time checks use the exchange's clock (the offset `sync_time` measures at start), not
+this machine's, so a drifting host clock cannot make fresh bars look stale or the reverse.
+
+A symbol whose candles cannot be fetched (a timeout, say) is skipped for that cycle without
+stopping the others. Rate limiting (HTTP 429) or a Binance outage (5xx) ends the cycle
+instead, since asking for the next symbol only adds requests and repeated 429s earn an IP
+ban. A fatal error (bad key, banned IP) stops the loop. A cycle in which **no** symbol had
+usable data counts toward `MAX_CONSECUTIVE_FAILURES`, so a dead feed stops the loop instead
+of leaving it running blind. `backtest` applies the per-bar and ordering checks to CSV input
+too, and exits with an error on a broken file.
 
 ### Audit log
 
@@ -107,7 +116,9 @@ Every run appends JSON lines to `EVENT_LOG_PATH` (default `data/events.jsonl`):
 `live-started`, one `cycle` per pass with each symbol's action and reason, `cycle-failed`
 with the error, and `live-stopped` with why (`stop-signal`, `fatal-error` or
 `too-many-failures`). The API key appears only masked. A failed write is logged, never
-raised, so the audit log can never be the reason a position is left unmanaged.
+raised, so the audit log can never be the reason a position is left unmanaged. At 10 MB the
+file is rotated to `events.jsonl.1` (replacing the previous one), so a long run cannot fill
+the disk that the ledger and risk state are saved to.
 
 ### What the bot believes it holds
 

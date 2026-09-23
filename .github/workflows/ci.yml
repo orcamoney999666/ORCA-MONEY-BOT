@@ -55,3 +55,8 @@ jobs:
 
       - name: Smoke-check configuration
         run: python binance_trading_bot.py config-check
+
+      - name: Smoke-check the bridge
+        run: |
+          printf '%s\n' '{"command":"health"}' | python orca_bridge.py | tee bridge.out
+          grep -q '"ok": true' bridge.out

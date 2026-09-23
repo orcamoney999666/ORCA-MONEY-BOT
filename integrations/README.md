@@ -24,3 +24,23 @@ every call, and a bridge with no ledger would not know it already holds a positi
 
 State is written back to `RISK_STATE_PATH` after each cycle, so a restarted bridge picks
 up where it left off.
+
+## Input limits
+
+The bridge talks to other local processes, so it bounds what they can send:
+
+- Each request line is read at most 256 KiB at a time. A longer line is answered with
+  `request is too large` and discarded, and the bridge keeps serving the next one.
+- Blank lines are ignored; anything that is not a JSON object is answered with an error.
+- Input is decoded as UTF-8 leniently: an invalid byte fails that one request instead of
+  ending the stream.
+- `backtest` only reads `.csv` files inside one folder, `data/` by default. Set
+  `ORCA_BRIDGE_CSV_DIR` to change it (an empty value means `data/`). A relative path is taken from that folder, and a path
+  outside it (including one that climbs out with `..`) is refused.
+
+## Data checks and the audit log
+
+`signal` runs the same market-data checks as the live cycle, on the exchange's clock: a
+stale feed, a missing bar, or a malformed candle is answered with an error instead of a signal. Every `live_cycle`
+is also appended to `EVENT_LOG_PATH` with `"source": "bridge"`, next to the events the
+`live` command writes.

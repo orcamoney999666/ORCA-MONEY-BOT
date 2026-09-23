@@ -30,25 +30,48 @@ run it yourself — nothing in this repo schedules or auto-starts it — but onc
 running and trading on its own, evaluating every symbol every `LIVE_POLL_SECONDS` (default 60),
 until you stop it with Ctrl+C or `SIGTERM`.
 
-Each cycle, per symbol:
-1. Skip if there is already an open order on that symbol (no duplicate entries).
-2. Fetch recent klines and ask `RegimeStrategy` for a signal.
-3. A `SELL` signal is skipped, not sent as a real order. **Binance spot cannot short** — a
-   `SELL` only makes sense to close a position you already hold, so this bot only ever
-   opens long via `BUY` and exits via the OCO bracket below.
-4. On an approved `BUY`, it places a real market buy, then immediately places a real OCO
-   order (`place_oco_order`) as the stop-loss + take-profit bracket, using the same ATR
-   multipliers as backtest/paper mode.
+Each cycle, in this order:
 
-`RiskGate` state (equity, daily P&L, day rollover, trade count/timestamps) is persisted to
-`RISK_STATE_PATH` (default `data/risk_state.json`) and reloaded on start, so the daily-loss,
-drawdown, and hourly-trade limits stay meaningful across separate runs instead of resetting
-every time you start the loop.
+1. **Resolve unconfirmed entries.** An order whose response was never seen (a timeout, a
+   crash) is looked up by the client order id chosen before it was sent, so the bot learns
+   what actually happened instead of guessing.
+2. **Book resolved brackets.** A bracket that has filled becomes realized P&L on the
+   `RiskGate`, which is what makes the daily-loss and drawdown limits move at all.
+3. **Protect anything unprotected.** Every held position must carry an OCO bracket. If one
+   cannot be placed, the position is closed at market rather than left without a stop.
+4. **Read the real balance.** Sizing and the loss limits are percentages of the account, so
+   the account is what they are measured against — never `PAPER_START_BALANCE`.
+5. **Consider a new entry, per symbol.** Skip symbols the ledger already holds. Decide on
+   closed candles only, price from the live ticker, size capped by `MAX_NOTIONAL_PCT`,
+   quantity rounded to the exchange's lot step, then a market buy followed immediately by
+   its OCO bracket.
 
-**Known gap:** this cycle only limits how many *new* positions can be opened
-(`MAX_OPEN_POSITIONS`). It does not yet poll filled orders back to credit/debit
-`risk.equity` with the real realized P&L once a bracket fills — that reconciliation is a
-separate next step before relying on the daily-loss/drawdown limits for capital already at risk.
+A `SELL` signal is skipped, never sent. **Binance spot cannot short** — a `SELL` only makes
+sense to close a position you already hold, so this bot only ever opens long via `BUY` and
+exits via the OCO bracket.
+
+### What the bot believes it holds
+
+Open positions live in a persisted **position ledger** (`POSITIONS_PATH`, default
+`data/positions.json`), not in the exchange's open orders. A filled market buy leaves no
+open order behind, so a bot that asks "are there open orders?" concludes it holds nothing —
+and buys the same symbol again on the next cycle. The ledger is the answer to that, and it
+survives restarts.
+
+`RiskGate` state (equity, daily P&L, day rollover, trade count and timestamps) is persisted
+to `RISK_STATE_PATH` (default `data/risk_state.json`), written atomically, and reloaded on
+start. If either file is unreadable the live loop **refuses to start** rather than resuming
+with every circuit breaker silently reset to zero.
+
+### Before the first order
+
+`run_live` reads the API key's own restrictions and refuses to trade if the key can
+withdraw, or if it has no IP allowlist (`REQUIRE_KEY_IP_RESTRICTION=0` waives the second
+knowingly). It then syncs the clock against Binance, because a drifting host clock makes
+every signed request fail.
+
+The loop stops rather than grinding on: a fatal error (bad key, bad signature, banned IP)
+ends it immediately, and `MAX_CONSECUTIVE_FAILURES` cycles failing in a row ends it too.
 
 ```bash
 export TRADING_MODE=live
@@ -68,7 +91,9 @@ in the Binance app, no order book involved:
   Read-only: works in any mode with valid API keys, quoting does not move funds.
 - `accept_convert_quote(quote_id)` — execute a previously fetched quote. Gated to `Mode.LIVE`.
 - `get_convert_order_status(order_id=..., quote_id=...)` — check a conversion's status.
-- `convert(from_asset, to_asset, from_amount)` — quote + accept in one call, gated to `Mode.LIVE`.
+- `convert(from_asset, to_asset, from_amount, min_to_amount=None)` — quote + accept in one
+  call, gated to `Mode.LIVE`. Pass `min_to_amount` for anything unattended: without a floor
+  this accepts whatever rate comes back.
 
 This is exposed as a primitive on `BinanceREST`, callable directly (e.g. from a script or a
 REPL) exactly like a manual trade. It is **not** wired into the `live` loop's automatic
@@ -101,6 +126,27 @@ quantity to the lot-size step before sending it, and rejects (`no-trade`, reason
 anyway. Before this, a computed quantity that violated `LOT_SIZE`/`NOTIONAL` would have
 been sent as-is and failed at Binance's end.
 
+
+## Safety settings
+
+All optional, with the defaults shown. They only matter in live mode.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `MAX_NOTIONAL_PCT` | `20` | Caps one order's notional as a share of the account. The risk budget divided by a small ATR is a large order, so the calmer the market the bigger the position a fixed risk buys. |
+| `STOP_LIMIT_BUFFER_PCT` | `0.2` | How far the OCO stop-limit leg sits below its trigger. A stop-limit priced at its own trigger often rests unfilled while price runs past it. |
+| `POSITIONS_PATH` | `data/positions.json` | Where the position ledger is kept. |
+| `REQUIRE_KEY_IP_RESTRICTION` | `1` | Refuse to trade with an API key that has no IP allowlist. |
+| `MAX_CONSECUTIVE_FAILURES` | `5` | Stop the live loop after this many failed cycles in a row. |
+| `RECV_WINDOW_MS` | `5000` | Binance `recvWindow` for signed requests. |
+| `FILTERS_CACHE_SECONDS` | `3600` | How long a symbol's exchange filters are cached, instead of re-fetching `exchangeInfo` per order. |
+| `MAX_WEIGHT_PER_MINUTE` | `1200` | Request-weight budget; the cycle pauses new entries at 80% of it. |
+| `KLINE_INTERVAL` | `1h` | Candle interval the strategy decides on. |
+
+`MAX_DAILY_LOSS_PCT`, `MAX_DRAWDOWN_PCT` and `MAX_NOTIONAL_PCT` must each be greater than 0
+and at most 100; a value outside that is rejected at startup rather than silently disabling
+the breaker.
+
 ## التشغيل
 
 ```bash
@@ -128,7 +174,7 @@ export BINANCE_API_SECRET='...'
 python3 binance_trading_bot.py fetch
 ```
 
-**التداول الحي غير موصى به قبل اختبار طويل ومراجعة مستقلة.** لا تستخدم مفاتيح بصلاحية السحب، وفَعّل IP allowlist، وابدأ بصلاحية قراءة/تداول فقط. لا يوجد في هذه النسخة نظام أخبار أو تحليل سياسي/اجتماعي آلي؛ إدخال هذه المصادر يحتاج مزود بيانات موثوق، تعريفًا زمنيًا واضحًا، واختبارات تمنع تحويل الأخبار إلى قرارات غير قابلة للتدقيق.
+**التداول الحي غير موصى به قبل اختبار طويل ومراجعة مستقلة.** البوت نفسه يرفض الآن التشغيل الحي بمفتاح يملك صلاحية السحب أو بلا IP allowlist، لكن ذلك لا يغني عن إنشاء المفتاح بصلاحية تداول فقط من البداية. لا تستخدم مفاتيح بصلاحية السحب، وفَعّل IP allowlist، وابدأ بصلاحية قراءة/تداول فقط. لا يوجد في هذه النسخة نظام أخبار أو تحليل سياسي/اجتماعي آلي؛ إدخال هذه المصادر يحتاج مزود بيانات موثوق، تعريفًا زمنيًا واضحًا، واختبارات تمنع تحويل الأخبار إلى قرارات غير قابلة للتدقيق.
 
 ## بنية التطوير التالية
 

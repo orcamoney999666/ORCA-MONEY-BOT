@@ -3,14 +3,19 @@ import os
 import signal
 import tempfile
 import unittest
+import urllib.error
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("TRADING_MODE", "paper")
 from binance_trading_bot import (
-    BinanceREST, Candle, Config, Mode, RegimeStrategy, RiskGate, Signal, atr, backtest,
-    load_risk_state, round_to_step, run_live, run_live_cycle, save_risk_state,
+    BinanceError, BinanceREST, Candle, Config, ConfigError, LivePosition, Mode, PositionLedger,
+    RegimeStrategy, RiskGate, Signal, _atomic_write_text, _net_filled_quantity, _stop_limit_price,
+    assert_key_is_trade_only, atr, backtest, live_equity, load_risk_state, realized_pnl,
+    reconcile_positions, round_to_step, run_live, run_live_cycle, save_risk_state,
 )
+
 
 class BotTests(unittest.TestCase):
     def test_atr_is_positive(self):
@@ -35,19 +40,35 @@ class BotTests(unittest.TestCase):
         result = backtest([], Config())
         self.assertEqual(result["trades"], 0)
 
-    def test_hourly_limit(self):
+    def test_hourly_limit_counts_entries_not_exits(self):
+        """The limit has to count a position when it opens. Counting on close means a run
+        that never closes anything never counts, and the limit never fires (finding C2)."""
         cfg = Config(max_trades_per_hour=1)
         gate = RiskGate(cfg)
-        gate.closed(-1)
+        gate.opened()
         ok, _, reason = gate.approve(Signal.BUY, 100, 2, 0)
         self.assertFalse(ok); self.assertEqual(reason, "hourly-trade-limit")
 
-def _mock_response(payload: bytes):
+    def test_closing_a_trade_does_not_consume_the_hourly_budget(self):
+        gate = RiskGate(Config(max_trades_per_hour=1))
+        gate.closed(-1.0)
+        self.assertEqual(gate.trade_times, [])
+        ok, _, _ = gate.approve(Signal.BUY, 100, 2, 0)
+        self.assertTrue(ok)
+
+
+def _mock_response(payload: bytes, headers=None):
     resp = MagicMock()
     resp.read.return_value = payload
+    resp.headers = headers if headers is not None else {}
     resp.__enter__.return_value = resp
     resp.__exit__.return_value = False
     return resp
+
+
+def _http_error(status: int, body: dict, headers=None):
+    return urllib.error.HTTPError("https://api.binance.com/api/v3/order", status, "Error",
+                                  headers or {}, BytesIO(json.dumps(body).encode()))
 
 
 def _live_config(**overrides) -> Config:
@@ -56,7 +77,7 @@ def _live_config(**overrides) -> Config:
     return Config(**base)
 
 
-def _trending_candles(n: int = 70, rising: bool = True) -> list[Candle]:
+def _trending_candles(n: int = 70, rising: bool = True) -> list:
     candles = []
     price = 100.0
     step = 0.5 if rising else -0.5
@@ -64,6 +85,15 @@ def _trending_candles(n: int = 70, rising: bool = True) -> list[Candle]:
         price += step
         candles.append(Candle(i, price - 0.2, price + 1.0, price - 1.0, price))
     return candles
+
+
+def _fill(qty, price, commission="0", asset="USDT"):
+    return {"commission": commission, "commissionAsset": asset, "qty": str(qty), "price": str(price)}
+
+
+def _filled_order(qty, price, fills=None):
+    return {"status": "FILLED", "executedQty": str(qty), "cummulativeQuoteQty": str(qty * price),
+            "fills": fills if fills is not None else []}
 
 
 class BinanceRESTOrderTests(unittest.TestCase):
@@ -137,6 +167,214 @@ class BinanceRESTOrderTests(unittest.TestCase):
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(result["status"], "NEW")
 
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_market_order_carries_a_client_order_id(self, mock_urlopen):
+        """H4: a timed-out order is only answerable if we chose its id up front."""
+        mock_urlopen.return_value = _mock_response(b'{"status": "FILLED"}')
+        BinanceREST(_live_config()).market_order("BTCUSDT", "BUY", 0.01, client_order_id="orca-BTCUSDT-1")
+        self.assertIn("newClientOrderId=orca-BTCUSDT-1", mock_urlopen.call_args[0][0].full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_get_order_by_client_id_queries_orig_client_order_id(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"status": "FILLED"}')
+        BinanceREST(_live_config()).get_order_by_client_id("BTCUSDT", "orca-1")
+        self.assertIn("origClientOrderId=orca-1", mock_urlopen.call_args[0][0].full_url)
+
+
+class RequestHardeningTests(unittest.TestCase):
+    """H1, H2, M3, L4: what the transport does with errors, limits, clocks and the key."""
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_binance_error_body_is_preserved(self, mock_urlopen):
+        """H1: the code and message live in the response body, which urlopen discards."""
+        mock_urlopen.side_effect = _http_error(400, {"code": -2010, "msg": "Account has insufficient balance"})
+        with self.assertRaises(BinanceError) as caught:
+            BinanceREST(_live_config()).market_order("BTCUSDT", "BUY", 0.01)
+        self.assertEqual(caught.exception.code, -2010)
+        self.assertEqual(caught.exception.msg, "Account has insufficient balance")
+        self.assertIn("insufficient balance", str(caught.exception))
+
+    @patch("binance_trading_bot.time.sleep")
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_non_json_error_body_still_produces_a_binance_error(self, mock_urlopen, _mock_sleep):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://api.binance.com/api/v3/order", 502, "Bad Gateway", {}, BytesIO(b"<html>nginx</html>"))
+        with self.assertRaises(BinanceError) as caught:
+            BinanceREST(_live_config()).get_open_orders("BTCUSDT")
+        self.assertEqual(caught.exception.status, 502)
+        self.assertIsNone(caught.exception.code)
+
+    def test_fatal_errors_are_flagged_so_the_loop_can_stop(self):
+        self.assertTrue(BinanceError(401, None, "", "/p").is_fatal)
+        self.assertTrue(BinanceError(418, None, "", "/p").is_fatal)
+        self.assertTrue(BinanceError(400, -2014, "bad key", "/p").is_fatal)
+        self.assertFalse(BinanceError(400, -2010, "no balance", "/p").is_fatal)
+
+    def test_an_ip_ban_is_never_retried(self):
+        """418 is the ban that follows repeated 429s; retrying it lengthens the ban."""
+        self.assertFalse(BinanceError(418, None, "banned", "/p").is_retryable)
+        self.assertTrue(BinanceError(429, None, "too many", "/p").is_retryable)
+
+    @patch("binance_trading_bot.time.sleep")
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_rate_limited_read_is_retried_after_the_retry_after_delay(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = [_http_error(429, {"code": -1003, "msg": "too many requests"},
+                                               headers={"Retry-After": "3"}),
+                                    _mock_response(b"[]")]
+        result = BinanceREST(_live_config()).get_open_orders("BTCUSDT")
+        self.assertEqual(result, [])
+        mock_sleep.assert_called_once_with(3.0)
+
+    @patch("binance_trading_bot.time.sleep")
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_a_rate_limited_order_post_is_never_retried(self, mock_urlopen, mock_sleep):
+        """H2: without knowing whether the first attempt landed, a retried order is a
+        second position."""
+        mock_urlopen.side_effect = _http_error(429, {"code": -1003, "msg": "too many requests"})
+        with self.assertRaises(BinanceError):
+            BinanceREST(_live_config()).market_order("BTCUSDT", "BUY", 0.01)
+        self.assertEqual(mock_urlopen.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_used_weight_header_is_tracked(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b"[]", headers={"X-MBX-USED-WEIGHT-1M": "1100"})
+        client = BinanceREST(_live_config(max_weight_per_minute=1200))
+        client.get_open_orders("BTCUSDT")
+        self.assertEqual(client.used_weight, 1100)
+        self.assertTrue(client.weight_is_critical())
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_signed_requests_carry_a_recv_window(self, mock_urlopen):
+        """M3: without recvWindow Binance applies its 5s default to a possibly drifting clock."""
+        mock_urlopen.return_value = _mock_response(b"[]")
+        BinanceREST(_live_config(recv_window_ms=9000)).get_open_orders("BTCUSDT")
+        self.assertIn("recvWindow=9000", mock_urlopen.call_args[0][0].full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_sync_time_records_the_offset_and_shifts_timestamps(self, mock_urlopen):
+        client = BinanceREST(_live_config())
+        mock_urlopen.return_value = _mock_response(
+            json.dumps({"serverTime": int(__import__("time").time() * 1000) + 30_000}).encode())
+        offset = client.sync_time()
+        self.assertGreater(offset, 25_000)
+        mock_urlopen.return_value = _mock_response(b"[]")
+        client.get_open_orders("BTCUSDT")
+        sent = mock_urlopen.call_args[0][0].full_url
+        stamp = int(sent.split("timestamp=")[1].split("&")[0])
+        self.assertGreater(stamp, int(__import__("time").time() * 1000) + 25_000)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_api_key_is_not_sent_on_public_endpoints(self, mock_urlopen):
+        """L4: the key identifies the account, so it travels only where an account is needed."""
+        mock_urlopen.return_value = _mock_response(b'{"symbols": []}')
+        BinanceREST(_live_config()).get_exchange_info("BTCUSDT")
+        self.assertNotIn("X-MBX-APIKEY", mock_urlopen.call_args[0][0].headers)
+        mock_urlopen.return_value = _mock_response(b"[]")
+        BinanceREST(_live_config()).get_open_orders("BTCUSDT")
+        headers = {k.lower(): v for k, v in mock_urlopen.call_args[0][0].headers.items()}
+        self.assertIn("x-mbx-apikey", headers)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_symbol_filters_are_cached_between_calls(self, mock_urlopen):
+        """H2: exchangeInfo is heavy and these values change weekly at most."""
+        payload = json.dumps({"symbols": [{"filters": [
+            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        ]}]}).encode()
+        mock_urlopen.return_value = _mock_response(payload)
+        client = BinanceREST(_live_config())
+        for _ in range(5):
+            client.get_symbol_filters("BTCUSDT")
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+
+class CredentialTests(unittest.TestCase):
+    """H3 and M5: what the process can leak, and what the key is allowed to do."""
+
+    def test_api_secret_is_not_in_the_config_repr(self):
+        cfg = _live_config(api_key="AKIAEXAMPLEKEY", api_secret="SUPER_SECRET_VALUE")
+        self.assertNotIn("SUPER_SECRET_VALUE", repr(cfg))
+        self.assertNotIn("AKIAEXAMPLEKEY", repr(cfg))
+
+    def test_masked_key_shows_enough_to_identify_and_no_more(self):
+        cfg = _live_config(api_key="ABCD12345678WXYZ")
+        self.assertEqual(cfg.masked_key, "ABCD...WXYZ")
+        self.assertEqual(_live_config(api_key="short").masked_key, "(unset)")
+
+    def test_a_key_that_can_withdraw_is_refused(self):
+        client = MagicMock(spec=BinanceREST)
+        client.get_api_key_permissions.return_value = {"enableWithdrawals": True, "ipRestrict": True}
+        with self.assertRaises(RuntimeError) as caught:
+            assert_key_is_trade_only(client, _live_config())
+        self.assertIn("withdraw", str(caught.exception))
+
+    def test_a_key_with_no_ip_allowlist_is_refused_by_default(self):
+        client = MagicMock(spec=BinanceREST)
+        client.get_api_key_permissions.return_value = {"enableWithdrawals": False, "ipRestrict": False}
+        with self.assertRaises(RuntimeError) as caught:
+            assert_key_is_trade_only(client, _live_config())
+        self.assertIn("IP allowlist", str(caught.exception))
+
+    def test_the_ip_allowlist_requirement_can_be_waived_knowingly(self):
+        client = MagicMock(spec=BinanceREST)
+        client.get_api_key_permissions.return_value = {"enableWithdrawals": False, "ipRestrict": False}
+        assert_key_is_trade_only(client, _live_config(require_key_ip_restriction=False))
+
+    def test_an_unverifiable_key_is_refused(self):
+        client = MagicMock(spec=BinanceREST)
+        client.get_api_key_permissions.side_effect = BinanceError(403, -2015, "no permission", "/p")
+        with self.assertRaises(RuntimeError):
+            assert_key_is_trade_only(client, _live_config())
+
+    def test_a_trade_only_key_passes(self):
+        client = MagicMock(spec=BinanceREST)
+        client.get_api_key_permissions.return_value = {"enableWithdrawals": False, "ipRestrict": True}
+        assert_key_is_trade_only(client, _live_config())
+
+
+class ConfigValidationTests(unittest.TestCase):
+    """L1 and L2: limits that are not limits, and settings that crash before they report."""
+
+    def test_loss_limits_must_be_a_real_percentage(self):
+        for bad in (-5, 0, 101, 10_000):
+            with self.assertRaises(ValueError):
+                _live_config(max_daily_loss_pct=bad).validate()
+            with self.assertRaises(ValueError):
+                _live_config(max_drawdown_pct=bad).validate()
+
+    def test_notional_cap_and_stop_buffer_are_bounded(self):
+        with self.assertRaises(ValueError):
+            _live_config(max_notional_pct=0).validate()
+        with self.assertRaises(ValueError):
+            _live_config(max_notional_pct=101).validate()
+        with self.assertRaises(ValueError):
+            _live_config(stop_limit_buffer_pct=100).validate()
+
+    def test_kline_interval_must_be_one_binance_accepts(self):
+        with self.assertRaises(ValueError):
+            _live_config(kline_interval="7h").validate()
+
+    def test_default_config_still_validates(self):
+        _live_config().validate()
+
+    def test_a_bad_environment_value_names_the_variable(self):
+        with patch.dict(os.environ, {"TRADING_MODE": "lve"}):
+            with self.assertRaises(ConfigError) as caught:
+                Config()
+        self.assertIn("TRADING_MODE", str(caught.exception))
+
+    def test_a_non_numeric_setting_names_the_variable(self):
+        with patch.dict(os.environ, {"RISK_PER_TRADE_PCT": "abc"}):
+            with self.assertRaises(ConfigError) as caught:
+                Config()
+        self.assertIn("RISK_PER_TRADE_PCT", str(caught.exception))
+
+    def test_settings_are_read_when_the_config_is_built_not_at_import(self):
+        with patch.dict(os.environ, {"MAX_OPEN_POSITIONS": "7"}):
+            self.assertEqual(Config().max_open_positions, 7)
+        self.assertEqual(Config().max_open_positions, 3)
+
 
 class BinanceRESTConvertTests(unittest.TestCase):
     """Direct asset-to-asset conversion (Binance's Convert feature)."""
@@ -194,6 +432,23 @@ class BinanceRESTConvertTests(unittest.TestCase):
         mock_quote.assert_called_once_with("BTC", "ETH", 0.01)
         mock_accept.assert_called_once_with("q-42")
         self.assertEqual(result["orderStatus"], "SUCCESS")
+
+    @patch.object(BinanceREST, "accept_convert_quote")
+    @patch.object(BinanceREST, "get_convert_quote")
+    def test_convert_refuses_a_quote_below_the_floor(self, mock_quote, mock_accept):
+        """L3: without a floor this accepts whatever rate comes back."""
+        mock_quote.return_value = {"quoteId": "q-42", "toAmount": "0.5"}
+        with self.assertRaises(ValueError):
+            BinanceREST(_live_config()).convert("BTC", "ETH", 0.01, min_to_amount=1.0)
+        mock_accept.assert_not_called()
+
+    @patch.object(BinanceREST, "accept_convert_quote")
+    @patch.object(BinanceREST, "get_convert_quote")
+    def test_convert_accepts_a_quote_at_or_above_the_floor(self, mock_quote, mock_accept):
+        mock_quote.return_value = {"quoteId": "q-42", "toAmount": "1.5"}
+        mock_accept.return_value = {"orderStatus": "SUCCESS"}
+        BinanceREST(_live_config()).convert("BTC", "ETH", 0.01, min_to_amount=1.0)
+        mock_accept.assert_called_once_with("q-42")
 
 
 class BinanceRESTExtraOrderTests(unittest.TestCase):
@@ -276,6 +531,12 @@ class BinanceRESTExtraOrderTests(unittest.TestCase):
         self.assertNotIn("signature=", request.full_url)
 
     @patch("binance_trading_bot.urllib.request.urlopen")
+    def test_ticker_price_is_an_unsigned_get(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(b'{"symbol": "BTCUSDT", "price": "64000.12"}')
+        self.assertEqual(BinanceREST(Config()).ticker_price("BTCUSDT"), 64000.12)
+        self.assertNotIn("signature=", mock_urlopen.call_args[0][0].full_url)
+
+    @patch("binance_trading_bot.urllib.request.urlopen")
     def test_get_symbol_filters_extracts_known_fields(self, mock_urlopen):
         payload = json.dumps({"symbols": [{"filters": [
             {"filterType": "LOT_SIZE", "stepSize": "0.00010000", "minQty": "0.00010000", "maxQty": "9000.0"},
@@ -304,15 +565,68 @@ class RoundToStepTests(unittest.TestCase):
         self.assertEqual(round_to_step(1.5, 0.5), 1.5)
 
 
-class RiskStatePersistenceTests(unittest.TestCase):
+class BracketPricingTests(unittest.TestCase):
+    """M1: a stop-limit priced at its own trigger often does not fill."""
+
+    def test_stop_limit_sits_below_the_trigger(self):
+        cfg = _live_config(stop_limit_buffer_pct=0.2)
+        limit = _stop_limit_price(100.0, cfg, 0.01)
+        self.assertLess(limit, 100.0)
+        self.assertAlmostEqual(limit, 99.80, places=2)
+
+    def test_a_zero_buffer_is_allowed_but_explicit(self):
+        self.assertEqual(_stop_limit_price(100.0, _live_config(stop_limit_buffer_pct=0), 0.01), 100.0)
+
+
+class FillAccountingTests(unittest.TestCase):
+    def test_base_asset_commission_is_taken_off_the_sellable_quantity(self):
+        """A fee charged in the coin just bought reduces what can be bracketed."""
+        cfg = _live_config()
+        order = _filled_order(1.0, 100, fills=[_fill(1.0, 100, commission="0.001", asset="BTC")])
+        self.assertAlmostEqual(_net_filled_quantity(order, "BTCUSDT", cfg), 0.999)
+
+    def test_quote_asset_commission_does_not_reduce_the_quantity(self):
+        cfg = _live_config()
+        order = _filled_order(1.0, 100, fills=[_fill(1.0, 100, commission="0.1", asset="USDT")])
+        self.assertAlmostEqual(_net_filled_quantity(order, "BTCUSDT", cfg), 1.0)
+
+    def test_realized_pnl_uses_exit_fills_after_the_entry(self):
+        cfg = _live_config()
+        position = LivePosition(symbol="BTCUSDT", entry_price=100.0, stop=95, take=110,
+                                opened_at="now", entry_time_ms=1_000, entry_client_order_id="orca-1",
+                                quantity=2.0, protected=True)
+        client = MagicMock(spec=BinanceREST)
+        client.get_my_trades.return_value = [
+            {"isBuyer": True, "time": 900, "qty": "2.0", "quoteQty": "200.0"},        # the entry
+            {"isBuyer": False, "time": 2_000, "qty": "2.0", "quoteQty": "220.0",
+             "commission": "0.22", "commissionAsset": "USDT"},                        # the exit
+        ]
+        pnl, exited, last_exit = realized_pnl(client, cfg, position)
+        self.assertAlmostEqual(exited, 2.0)
+        self.assertEqual(last_exit, 2_000)
+        self.assertAlmostEqual(pnl, 220.0 - 200.0 - 0.22)
+
+    def test_no_exit_fills_reports_nothing_closed(self):
+        client = MagicMock(spec=BinanceREST)
+        client.get_my_trades.return_value = [{"isBuyer": True, "time": 2_000, "qty": "1", "quoteQty": "100"}]
+        position = LivePosition(symbol="BTCUSDT", entry_price=100.0, stop=95, take=110, opened_at="now",
+                                entry_time_ms=1_000, entry_client_order_id="orca-1", quantity=1.0)
+        self.assertEqual(realized_pnl(client, _live_config(), position), (0.0, 0.0, 1_000))
+
+
+class DurableStateTests(unittest.TestCase):
+    """M4: state that resets itself is worse than state that refuses to load."""
+
     def test_state_dict_round_trips_through_restore(self):
         gate = RiskGate(Config())
+        gate.opened()
         gate.closed(50.0)
         restored = RiskGate(Config())
         restored.restore(gate.state_dict())
         self.assertEqual(restored.equity, gate.equity)
         self.assertEqual(restored.trades, gate.trades)
         self.assertEqual(restored.trade_times, gate.trade_times)
+        self.assertEqual(restored.day_start_equity, gate.day_start_equity)
 
     def test_save_and_load_round_trip_through_disk(self):
         gate = RiskGate(Config())
@@ -334,51 +648,354 @@ class RiskStatePersistenceTests(unittest.TestCase):
             path.write_text("not json")
             self.assertEqual(load_risk_state(path), {})
 
+    def test_a_corrupt_risk_file_stops_a_live_run_rather_than_resetting_the_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            path.write_text("{truncated")
+            with self.assertRaises(RuntimeError) as caught:
+                load_risk_state(path, strict=True)
+        self.assertIn("refuses to start", str(caught.exception))
+
+    def test_a_failed_write_leaves_the_previous_file_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            path.write_text('{"equity": 1234}')
+            with patch("binance_trading_bot.os.replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    _atomic_write_text(path, "replacement")
+            self.assertEqual(json.loads(path.read_text())["equity"], 1234)
+            self.assertEqual(list(p.name for p in Path(tmp).iterdir()), ["risk_state.json"])
+
+    def test_the_position_ledger_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "positions.json"
+            ledger = PositionLedger(path)
+            ledger.record(LivePosition(symbol="BTCUSDT", entry_price=100.0, stop=95, take=110,
+                                       opened_at="now", entry_time_ms=1, entry_client_order_id="orca-1",
+                                       quantity=2.0, protected=True))
+            reloaded = PositionLedger(path).load()
+        self.assertTrue(reloaded.holds("BTCUSDT"))
+        self.assertEqual(reloaded.get("BTCUSDT").quantity, 2.0)
+        self.assertTrue(reloaded.get("BTCUSDT").protected)
+
+    def test_a_corrupt_ledger_refuses_to_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "positions.json"
+            path.write_text("{oops")
+            with self.assertRaises(RuntimeError):
+                PositionLedger(path).load()
+
+
+class EquityTests(unittest.TestCase):
+    """C3: sizing has to come from the account, not from PAPER_START_BALANCE."""
+
+    def test_live_equity_reads_the_quote_balance(self):
+        client = MagicMock(spec=BinanceREST)
+        client.account.return_value = {"balances": [{"asset": "BTC", "free": "1", "locked": "0"},
+                                                    {"asset": "USDT", "free": "480.5", "locked": "19.5"}]}
+        self.assertAlmostEqual(live_equity(client, _live_config(), PositionLedger()), 500.0)
+
+    def test_live_equity_counts_what_open_positions_cost(self):
+        """Money in a position is not a drawdown."""
+        client = MagicMock(spec=BinanceREST)
+        client.account.return_value = {"balances": [{"asset": "USDT", "free": "400", "locked": "0"}]}
+        ledger = PositionLedger()
+        ledger.record(LivePosition(symbol="BTCUSDT", entry_price=50.0, stop=45, take=60, opened_at="now",
+                                   entry_time_ms=1, entry_client_order_id="orca-1", quantity=2.0))
+        self.assertAlmostEqual(live_equity(client, _live_config(), ledger), 500.0)
+
+    def test_the_daily_loss_limit_measures_against_the_real_balance(self):
+        gate = RiskGate(_live_config(initial_equity=10_000, max_daily_loss_pct=2))
+        gate.set_equity(500.0)                      # the account actually holds 500
+        gate.closed(-11.0)                          # 2.2% of 500, over the limit
+        ok, _, reason = gate.approve(Signal.BUY, 100, 2, 0)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "daily-loss-limit")
+
+    def test_a_loss_inside_the_limit_still_trades(self):
+        gate = RiskGate(_live_config(initial_equity=10_000, max_daily_loss_pct=2))
+        gate.set_equity(500.0)
+        gate.closed(-5.0)                           # 1% of 500
+        ok, _, _ = gate.approve(Signal.BUY, 100, 2, 0)
+        self.assertTrue(ok)
+
 
 class LiveCycleTests(unittest.TestCase):
     """run_live_cycle is one pass; the network is always a MagicMock(spec=BinanceREST)."""
 
-    def _client(self, candles, open_orders=None, filters=None):
+    def _client(self, candles, open_orders=None, filters=None, balance="10000", order=None):
         client = MagicMock(spec=BinanceREST)
-        client.get_open_orders.return_value = open_orders or []
+        client.get_open_orders.return_value = open_orders if open_orders is not None else []
         client.klines.return_value = candles
+        client.weight_is_critical.return_value = False
+        client.account.return_value = {"balances": [{"asset": "USDT", "free": balance, "locked": "0"}]}
+        client.ticker_price.return_value = candles[-2].close if len(candles) > 1 else 100.0
         client.get_symbol_filters.return_value = filters or {
             "step_size": None, "min_qty": None, "tick_size": None, "min_notional": None,
         }
-        client.market_order.return_value = {"status": "FILLED"}
+        price = client.ticker_price.return_value
+        client.market_order.return_value = order if order is not None else _filled_order(1.0, price)
         client.place_oco_order.return_value = {"orderListId": 1}
+        client.get_my_trades.return_value = []
         return client
 
-    def test_skips_symbol_with_existing_open_order(self):
-        cfg = _live_config(symbols=("BTCUSDT",))
-        client = self._client(_trending_candles(), open_orders=[{"orderId": 1}])
-        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
-        self.assertEqual(result["results"][0]["reason"], "open-order-exists")
-        client.market_order.assert_not_called()
-        client.place_oco_order.assert_not_called()
+    def _run(self, cfg, client, ledger=None, risk=None):
+        ledger = ledger if ledger is not None else PositionLedger()
+        return run_live_cycle(cfg, client, risk or RiskGate(cfg), RegimeStrategy(cfg), ledger), ledger
 
     def test_sell_signal_is_never_sent_as_open_short(self):
         cfg = _live_config(symbols=("BTCUSDT",))
         client = self._client(_trending_candles(rising=False))
-        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        result, _ = self._run(cfg, client)
         self.assertEqual(result["results"][0]["reason"], "spot-no-short")
         client.market_order.assert_not_called()
 
     def test_approved_buy_places_real_order_and_oco_bracket(self):
         cfg = _live_config(symbols=("BTCUSDT",))
         client = self._client(_trending_candles(rising=True))
-        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        result, ledger = self._run(cfg, client)
         self.assertEqual(result["results"][0]["action"], "opened")
         client.market_order.assert_called_once()
         self.assertEqual(client.market_order.call_args[0][1], "BUY")
         client.place_oco_order.assert_called_once()
         self.assertEqual(client.place_oco_order.call_args[0][1], "SELL")
+        self.assertTrue(ledger.holds("BTCUSDT"))
+        self.assertTrue(ledger.get("BTCUSDT").protected)
+
+    def test_the_bracket_limit_leg_is_below_its_trigger(self):
+        cfg = _live_config(symbols=("BTCUSDT",), stop_limit_buffer_pct=0.5)
+        client = self._client(_trending_candles(rising=True))
+        self._run(cfg, client)
+        sent = client.place_oco_order.call_args[1]
+        self.assertLess(sent["stop_limit_price"], sent["stop_price"])
+
+    def test_a_held_position_is_never_bought_again(self):
+        """C1: the ledger is what says the bot is in a trade. A filled market buy leaves
+        no open order, so an open-order check would buy again every cycle."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        _, ledger = self._run(cfg, client)
+        self.assertEqual(client.market_order.call_count, 1)
+        client.get_open_orders.return_value = [{"orderId": 1}]   # bracket resting
+        result, _ = self._run(cfg, client, ledger=ledger)
+        self.assertEqual(result["results"][0]["reason"], "position-open")
+        self.assertEqual(client.market_order.call_count, 1)
+
+    def test_a_failed_bracket_flattens_the_position_instead_of_leaving_it_stopless(self):
+        """C1: the whole finding. The entry filled, the bracket did not."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.place_oco_order.side_effect = BinanceError(400, -2010, "insufficient balance", "/oco")
+        result, ledger = self._run(cfg, client)
+        self.assertEqual(result["results"][0]["action"], "flattened")
+        sides = [call[0][1] for call in client.market_order.call_args_list]
+        self.assertEqual(sides, ["BUY", "SELL"])
+        client.cancel_all_open_orders.assert_called_once_with("BTCUSDT")
+        self.assertEqual(len(ledger), 0)
+
+    def test_a_position_that_cannot_be_flattened_stays_on_the_books_and_is_not_doubled(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.place_oco_order.side_effect = BinanceError(400, -2010, "insufficient balance", "/oco")
+        client.market_order.side_effect = [_filled_order(1.0, 134.0),
+                                           BinanceError(400, -1013, "cannot sell", "/order")]
+        result, ledger = self._run(cfg, client)
+        self.assertEqual(result["results"][0]["action"], "alert")
+        self.assertTrue(ledger.holds("BTCUSDT"))
+        self.assertFalse(ledger.get("BTCUSDT").protected)
+
+        # Next cycle: it must try to protect what it holds, not open a second position.
+        client.market_order.side_effect = None
+        client.market_order.reset_mock()
+        client.place_oco_order.side_effect = None
+        client.place_oco_order.return_value = {"orderListId": 9}
+        result, ledger = self._run(cfg, client, ledger=ledger)
+        self.assertEqual(result["results"][0]["action"], "opened")
+        client.market_order.assert_not_called()
+        self.assertTrue(ledger.get("BTCUSDT").protected)
+
+    def test_an_entry_whose_response_was_lost_is_resolved_by_client_order_id(self):
+        """H4: a timeout is ambiguous; the client order id makes it answerable."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.market_order.side_effect = TimeoutError("read timed out")
+        result, ledger = self._run(cfg, client)
+        self.assertEqual(result["results"][0]["reason"], "entry-order-failed")
+        self.assertTrue(ledger.holds("BTCUSDT"))
+        self.assertEqual(ledger.get("BTCUSDT").quantity, 0.0)
+
+        # The order had in fact reached Binance and filled.
+        coid = ledger.get("BTCUSDT").entry_client_order_id
+        client.market_order.side_effect = None
+        client.market_order.reset_mock()
+        client.get_order_by_client_id.return_value = _filled_order(1.0, 134.0)
+        result, ledger = self._run(cfg, client, ledger=ledger)
+        client.get_order_by_client_id.assert_called_once_with("BTCUSDT", coid)
+        actions = [r["action"] for r in result["results"]]
+        self.assertIn("recovered", actions)
+        self.assertIn("opened", actions)
+        client.market_order.assert_not_called()
+        self.assertTrue(ledger.get("BTCUSDT").protected)
+
+    def test_an_entry_that_never_reached_binance_clears_the_reservation(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.market_order.side_effect = TimeoutError("read timed out")
+        _, ledger = self._run(cfg, client)
+        client.get_order_by_client_id.side_effect = BinanceError(400, -2013, "Order does not exist", "/order")
+        client.market_order.side_effect = None
+        result, ledger = self._run(cfg, client, ledger=ledger)
+        self.assertEqual(result["results"][0]["reason"], "entry-never-placed")
+
+    def test_a_resolved_bracket_books_its_pnl_against_the_risk_gate(self):
+        """C2: until this happens daily_pnl never moves and no loss limit can fire."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        risk = RiskGate(cfg)
+        _, ledger = self._run(cfg, client, risk=risk)
+        entry = ledger.get("BTCUSDT")
+        self.assertEqual(risk.daily_pnl, 0.0)
+
+        client.get_open_orders.return_value = []            # the bracket resolved
+        client.get_my_trades.return_value = [
+            {"isBuyer": False, "time": entry.entry_time_ms + 1, "qty": str(entry.quantity),
+             "quoteQty": str(entry.quantity * (entry.entry_price - 10)),
+             "commission": "0", "commissionAsset": "USDT"},
+        ]
+        # Hold off new entries so this asserts on the close alone.
+        client.weight_is_critical.return_value = True
+        result, ledger = self._run(cfg, client, ledger=ledger, risk=risk)
+        self.assertEqual(result["results"][0]["action"], "closed")
+        self.assertAlmostEqual(risk.daily_pnl, -10 * entry.quantity)
+        self.assertEqual(risk.trades, 1)
+        self.assertEqual(len(ledger), 0)
+
+    def test_a_position_with_no_bracket_and_no_exit_fills_is_flattened(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        ledger = PositionLedger()
+        ledger.record(LivePosition(symbol="BTCUSDT", entry_price=100.0, stop=95, take=110, opened_at="now",
+                                   entry_time_ms=1, entry_client_order_id="orca-1", quantity=1.0,
+                                   protected=True))
+        client.get_open_orders.return_value = []
+        client.get_my_trades.return_value = []
+        results = reconcile_positions(cfg, client, RiskGate(cfg), ledger)
+        self.assertEqual(results[0]["reason"], "unprotected-on-reconcile")
+        self.assertEqual(len(ledger), 0)
+
+    def test_the_hourly_limit_stops_new_entries_in_live_mode(self):
+        """C2: the limit has to bind on entries, which is all a live cycle produces."""
+        cfg = _live_config(symbols=("BTCUSDT", "ETHUSDT"), max_trades_per_hour=1)
+        client = self._client(_trending_candles(rising=True))
+        result, _ = self._run(cfg, client)
+        reasons = [r.get("reason") for r in result["results"]]
+        self.assertIn("hourly-trade-limit", reasons)
+        self.assertEqual(client.market_order.call_count, 1)
+
+    def test_position_size_follows_the_real_balance(self):
+        """C3: a 500 USDT account must not be sized as if it held PAPER_START_BALANCE."""
+        cfg = _live_config(symbols=("BTCUSDT",), initial_equity=10_000, risk_per_trade_pct=0.25)
+        small = self._client(_trending_candles(rising=True), balance="500")
+        self._run(cfg, small)
+        large = self._client(_trending_candles(rising=True), balance="50000")
+        self._run(cfg, large)
+        self.assertLess(small.market_order.call_args[0][2], large.market_order.call_args[0][2])
+        self.assertAlmostEqual(small.market_order.call_args[0][2] * 100,
+                               large.market_order.call_args[0][2], places=4)
+
+    def test_notional_is_capped_against_the_balance(self):
+        """C3: the risk budget over a small ATR is a large order."""
+        cfg = _live_config(symbols=("BTCUSDT",), max_notional_pct=5, risk_per_trade_pct=2)
+        client = self._client(_trending_candles(rising=True), balance="10000")
+        self._run(cfg, client)
+        qty = client.market_order.call_args[0][2]
+        price = client.ticker_price.return_value
+        self.assertLessEqual(qty * price, 10_000 * 0.05 + 1e-6)
+
+    def test_no_trade_when_the_balance_cannot_be_read(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.account.side_effect = BinanceError(500, None, "server error", "/account")
+        result, _ = self._run(cfg, client)
+        self.assertEqual(result["results"][-1]["reason"], "equity-unavailable")
+        client.market_order.assert_not_called()
+
+    def test_a_fatal_error_is_not_swallowed_by_the_cycle(self):
+        """H1: a bad key retried silently every poll is a loop that never recovers."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.account.side_effect = BinanceError(401, -2014, "API-key format invalid", "/account")
+        with self.assertRaises(BinanceError):
+            self._run(cfg, client)
+
+    def test_a_partial_exit_books_what_closed_and_keeps_the_rest(self):
+        """Treating a half-filled bracket as flat would abandon the coins still held."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        ledger = PositionLedger()
+        ledger.record(LivePosition(symbol="BTCUSDT", entry_price=100.0, stop=95, take=110,
+                                   opened_at="now", entry_time_ms=1_000,
+                                   entry_client_order_id="orca-1", quantity=2.0, protected=True))
+        client.get_open_orders.return_value = []
+        client.get_my_trades.return_value = [
+            {"isBuyer": False, "time": 5_000, "qty": "0.5", "quoteQty": "55.0",
+             "commission": "0", "commissionAsset": "USDT"},
+        ]
+        risk = RiskGate(cfg)
+        results = reconcile_positions(cfg, client, risk, ledger)
+        self.assertEqual(results[0]["action"], "partially-closed")
+        self.assertAlmostEqual(risk.daily_pnl, 55.0 - 50.0)
+        self.assertTrue(ledger.holds("BTCUSDT"))
+        self.assertAlmostEqual(ledger.get("BTCUSDT").quantity, 1.5)
+        self.assertFalse(ledger.get("BTCUSDT").protected)
+        # The watermark moved past the fills just booked, so they are not counted twice.
+        self.assertEqual(ledger.get("BTCUSDT").entry_time_ms, 5_001)
+        reconcile_positions(cfg, client, risk, ledger)
+        self.assertAlmostEqual(risk.daily_pnl, 55.0 - 50.0)
+
+    def test_fills_are_read_back_when_the_order_lookup_has_none(self):
+        """A lookup by client order id carries no `fills`, so the base-asset fee is invisible."""
+        from binance_trading_bot import filled_quantity_for_order
+        client = MagicMock(spec=BinanceREST)
+        client.get_my_trades.return_value = [
+            {"orderId": 77, "qty": "1.0", "commission": "0.001", "commissionAsset": "BTC"},
+            {"orderId": 99, "qty": "5.0", "commission": "0", "commissionAsset": "BTC"},
+        ]
+        order = {"status": "FILLED", "executedQty": "1.0", "orderId": 77}
+        self.assertAlmostEqual(
+            filled_quantity_for_order(client, _live_config(), "BTCUSDT", order), 0.999)
+
+    def test_the_unclosed_candle_is_not_traded_on(self):
+        """M2: the last kline repaints until its interval ends."""
+        cfg = _live_config(symbols=("BTCUSDT",))
+        candles = _trending_candles(rising=True)
+        candles.append(Candle(999, 1.0, 1.0, 1.0, 1.0))    # an absurd in-progress bar
+        client = self._client(candles)
+        captured = {}
+        strategy = RegimeStrategy(cfg)
+        original = strategy.decide
+
+        def _record(seen):
+            captured["last"] = seen[-1]
+            return original(seen)
+
+        strategy.decide = _record
+        run_live_cycle(cfg, client, RiskGate(cfg), strategy, PositionLedger())
+        self.assertNotEqual(captured["last"].timestamp, 999)
+
+    def test_execution_price_comes_from_the_ticker_not_a_stale_candle(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.ticker_price.return_value = 200.0
+        self._run(cfg, client)
+        client.ticker_price.assert_called_with("BTCUSDT")
+        self.assertAlmostEqual(client.place_oco_order.call_args[1]["take_profit_price"], 200.0, delta=50)
 
     def test_order_quantity_is_rounded_to_lot_size_before_sending(self):
         cfg = _live_config(symbols=("BTCUSDT",), risk_per_trade_pct=1.7)
         filters = {"step_size": 0.001, "min_qty": 0.001, "tick_size": 0.01, "min_notional": None}
         client = self._client(_trending_candles(rising=True), filters=filters)
-        run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        self._run(cfg, client)
         sent_qty = client.market_order.call_args[0][2]
         # Tolerant of float noise: assert sent_qty lands on the step grid, not exact `%` == 0.
         self.assertAlmostEqual(sent_qty / 0.001, round(sent_qty / 0.001), places=6)
@@ -387,28 +1004,61 @@ class LiveCycleTests(unittest.TestCase):
         cfg = _live_config(symbols=("BTCUSDT",))
         filters = {"step_size": None, "min_qty": None, "tick_size": None, "min_notional": 10_000_000}
         client = self._client(_trending_candles(rising=True), filters=filters)
-        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        result, _ = self._run(cfg, client)
         self.assertEqual(result["results"][0]["reason"], "below-min-notional")
         client.market_order.assert_not_called()
 
     def test_no_data_is_skipped_not_crashed(self):
         cfg = _live_config(symbols=("BTCUSDT",))
         client = self._client([])
-        result = run_live_cycle(cfg, client, RiskGate(cfg), RegimeStrategy(cfg))
+        result, _ = self._run(cfg, client)
         self.assertEqual(result["results"][0]["reason"], "no-data")
+
+    def test_an_unfilled_entry_leaves_nothing_on_the_books(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True),
+                              order={"status": "EXPIRED", "executedQty": "0", "fills": []})
+        result, ledger = self._run(cfg, client)
+        self.assertEqual(result["results"][0]["reason"], "entry-unfilled")
+        self.assertEqual(len(ledger), 0)
+        client.place_oco_order.assert_not_called()
+
+    def test_trading_pauses_when_the_rate_limit_budget_is_nearly_spent(self):
+        cfg = _live_config(symbols=("BTCUSDT",))
+        client = self._client(_trending_candles(rising=True))
+        client.weight_is_critical.return_value = True
+        result, _ = self._run(cfg, client)
+        self.assertEqual(result["results"][0]["reason"], "rate-limit-budget")
+        client.market_order.assert_not_called()
 
 
 class LiveLoopTests(unittest.TestCase):
+    def _client(self):
+        client = MagicMock(spec=BinanceREST)
+        client.get_api_key_permissions.return_value = {"enableWithdrawals": False, "ipRestrict": True}
+        return client
+
     def test_run_live_blocked_outside_live_mode(self):
         with self.assertRaises(RuntimeError):
             run_live(Config(), MagicMock(spec=BinanceREST))
 
+    def test_run_live_refuses_a_key_that_can_withdraw(self):
+        client = self._client()
+        client.get_api_key_permissions.return_value = {"enableWithdrawals": True, "ipRestrict": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _live_config(symbols=("BTCUSDT",), risk_state_path=Path(tmp) / "r.json",
+                               positions_path=Path(tmp) / "p.json")
+            with self.assertRaises(RuntimeError):
+                run_live(cfg, client)
+
     def test_run_live_stops_on_first_cycle_when_signalled(self):
         """Simulates SIGINT arriving during the very first cycle: the loop must run
         run_live_cycle exactly once, persist state, and exit without sleeping."""
-        client = MagicMock(spec=BinanceREST)
+        client = self._client()
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5, risk_state_path=Path(tmp) / "risk_state.json")
+            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5,
+                               risk_state_path=Path(tmp) / "risk_state.json",
+                               positions_path=Path(tmp) / "positions.json")
             with patch("binance_trading_bot.run_live_cycle") as mock_cycle:
                 def _act_then_stop(*_args, **_kwargs):
                     os.kill(os.getpid(), signal.SIGINT)
@@ -418,5 +1068,38 @@ class LiveLoopTests(unittest.TestCase):
             mock_cycle.assert_called_once()
             self.assertTrue((Path(tmp) / "risk_state.json").exists())
 
+    def test_a_fatal_error_stops_the_loop_instead_of_retrying_forever(self):
+        """H1: an invalid key retried every 60s is a loop that never recovers and never says so."""
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5,
+                               risk_state_path=Path(tmp) / "r.json", positions_path=Path(tmp) / "p.json")
+            with patch("binance_trading_bot.run_live_cycle",
+                       side_effect=BinanceError(401, -2014, "API-key format invalid", "/order")):
+                with patch("binance_trading_bot.time.sleep") as mock_sleep:
+                    run_live(cfg, client)
+                mock_sleep.assert_not_called()
 
-if __name__ == "__main__": unittest.main()
+    def test_repeated_failures_stop_the_loop(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5, max_consecutive_failures=3,
+                               risk_state_path=Path(tmp) / "r.json", positions_path=Path(tmp) / "p.json")
+            with patch("binance_trading_bot.run_live_cycle", side_effect=RuntimeError("boom")) as mock_cycle:
+                with patch("binance_trading_bot.time.sleep"):
+                    run_live(cfg, client)
+            self.assertEqual(mock_cycle.call_count, 3)
+
+    def test_the_clock_is_synced_before_the_first_cycle(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _live_config(symbols=("BTCUSDT",), live_poll_seconds=5,
+                               risk_state_path=Path(tmp) / "r.json", positions_path=Path(tmp) / "p.json")
+            with patch("binance_trading_bot.run_live_cycle") as mock_cycle:
+                mock_cycle.side_effect = lambda *a, **k: os.kill(os.getpid(), signal.SIGINT)
+                run_live(cfg, client)
+            client.sync_time.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
